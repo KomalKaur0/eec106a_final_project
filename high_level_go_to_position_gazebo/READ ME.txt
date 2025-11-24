@@ -1,0 +1,12 @@
+If you're on mac: 
+
+Terminal 1: 
+gz sim -s tello_world.sdf
+
+Terminal 2: 
+gz sim -g
+
+Terminal 3: 
+python3 goto_position.py 3 2 5
+
+whatever position you want it to go to. 

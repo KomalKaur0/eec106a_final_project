@@ -10,6 +10,7 @@ setup.py
 ../../build/tello_controller/tello_controller.egg-info/zip-safe
 resource/tello_controller
 tello_controller/__init__.py
+tello_controller/tello_ar_tag_mission_node.py
 tello_controller/tello_camera_node.py
 tello_controller/tello_flight_node.py
 test/test_copyright.py

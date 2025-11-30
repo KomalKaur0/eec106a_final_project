@@ -1,8 +1,10 @@
 /Users/xiaoyuecindyhuang/ros2_tello_ws/install/tello_controller/lib/python3.11/site-packages/tello_controller/tello_camera_node.py
 /Users/xiaoyuecindyhuang/ros2_tello_ws/install/tello_controller/lib/python3.11/site-packages/tello_controller/__init__.py
+/Users/xiaoyuecindyhuang/ros2_tello_ws/install/tello_controller/lib/python3.11/site-packages/tello_controller/tello_ar_tag_mission_node.py
 /Users/xiaoyuecindyhuang/ros2_tello_ws/install/tello_controller/lib/python3.11/site-packages/tello_controller/tello_flight_node.py
 /Users/xiaoyuecindyhuang/ros2_tello_ws/install/tello_controller/lib/python3.11/site-packages/tello_controller/__pycache__/tello_camera_node.cpython-311.pyc
 /Users/xiaoyuecindyhuang/ros2_tello_ws/install/tello_controller/lib/python3.11/site-packages/tello_controller/__pycache__/__init__.cpython-311.pyc
+/Users/xiaoyuecindyhuang/ros2_tello_ws/install/tello_controller/lib/python3.11/site-packages/tello_controller/__pycache__/tello_ar_tag_mission_node.cpython-311.pyc
 /Users/xiaoyuecindyhuang/ros2_tello_ws/install/tello_controller/lib/python3.11/site-packages/tello_controller/__pycache__/tello_flight_node.cpython-311.pyc
 /Users/xiaoyuecindyhuang/ros2_tello_ws/install/tello_controller/share/ament_index/resource_index/packages/tello_controller
 /Users/xiaoyuecindyhuang/ros2_tello_ws/install/tello_controller/share/tello_controller/package.xml
@@ -14,5 +16,6 @@
 /Users/xiaoyuecindyhuang/ros2_tello_ws/install/tello_controller/lib/python3.11/site-packages/tello_controller-0.0.1-py3.11.egg-info/requires.txt
 /Users/xiaoyuecindyhuang/ros2_tello_ws/install/tello_controller/lib/python3.11/site-packages/tello_controller-0.0.1-py3.11.egg-info/top_level.txt
 /Users/xiaoyuecindyhuang/ros2_tello_ws/install/tello_controller/lib/python3.11/site-packages/tello_controller-0.0.1-py3.11.egg-info/dependency_links.txt
+/Users/xiaoyuecindyhuang/ros2_tello_ws/install/tello_controller/lib/tello_controller/tello_ar_tag_mission_node
 /Users/xiaoyuecindyhuang/ros2_tello_ws/install/tello_controller/lib/tello_controller/tello_camera
 /Users/xiaoyuecindyhuang/ros2_tello_ws/install/tello_controller/lib/tello_controller/tello_flight

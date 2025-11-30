@@ -1,0 +1,3 @@
+[console_scripts]
+tello_camera = tello_controller.tello_camera_node:main
+tello_flight = tello_controller.tello_flight_node:main

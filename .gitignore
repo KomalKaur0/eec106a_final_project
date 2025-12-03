@@ -1,2 +1,88 @@
-# DS_Store
+# ROS2 Build Artifacts
+build/
+install/
+log/
+ros2_tello_ws/build/
+ros2_tello_ws/install/
+ros2_tello_ws/log/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual Environments
+venv/
+env/
+ENV/
+.venv
+
+# macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# Gazebo
+.gazebo/
+gazebo_logs/
+*.log
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Environment files (may contain secrets)
+.env
+.env.local
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+tmp/
+temp/
+
+# Video/Image files (if you don't want to commit recordings)
+# Uncomment if needed:
+# *.mp4
+# *.avi
+# *.mov
+# recordings/
+
+# ROS specific
+devel/
+devel_isolated/
+*.bag
+*.bag.active
+*.orig
+CATKIN_IGNORE

@@ -5,14 +5,15 @@ from cv_bridge import CvBridge
 from djitellopy import Tello
 import cv2
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 
 import tf2_ros
 from tf2_ros import TransformBroadcaster
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped
 from visualization_msgs.msg import MarkerArray
 
-import tello_constants
+from tello_controller import tello_constants as tc
 
 class TelloEnvironmentNode(Node):
     """
@@ -42,11 +43,11 @@ class TelloEnvironmentNode(Node):
             9
         )
 
-        # TODO: tags/map/drone tf publishers
+        # tags/map/drone tf publishers
         # First tag becomes origin, try using mostly relative positions
         self.tf_broadcaster = TransformBroadcaster(self)
         
-        # TODO: Create subscribers
+        # Create subscribers
         # Subscribe to camera feed
         self.camera_subscriber = self.create_subscription(
             Image,
@@ -60,11 +61,23 @@ class TelloEnvironmentNode(Node):
         
         # State stuff
         self.bridge = CvBridge()
-        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X_1000)
-        self.aruco_params = cv2.aruco.DetectorParameters
-
         self.tag_map = {}
         self.map_frame = None
+
+        # Camera intrinsics (from constants file)
+        self.camera_matrix = tc.CAMERA_MATRIX
+        self.dist_coeffs = tc.DISTORTION_COEFFS
+        self.aruco_dict = tc.ARUCO_DICT
+        self.aruco_params = tc.ARUCO_PARAMS
+        self.marker_size_m = tc.MARKER_SIZE_M
+
+        # 3D marker corner points (in marker's local frame)
+        self.marker_points_3d = np.array([
+            [-self.marker_size_m/2,  self.marker_size_m/2, 0],  # top-left
+            [ self.marker_size_m/2,  self.marker_size_m/2, 0],  # top-right
+            [ self.marker_size_m/2, -self.marker_size_m/2, 0],  # bottom-right
+            [-self.marker_size_m/2, -self.marker_size_m/2, 0],  # bottom-left
+        ], dtype=np.float32)
 
     def camera_callback(self, msg: Image):
         """
@@ -87,19 +100,88 @@ class TelloEnvironmentNode(Node):
             parameters=self.aruco_params
         )
 
-        # Pose estimation
+        # Check if any markers were detected
+        if ids is None or len(ids) == 0:
+            return  # No markers found
+
+        # Pose estimation for each detected marker
         for i, marker_id in enumerate(ids.flatten()):
-            success, rvec, tvec = cv2.solvePnP(...)
+            frame_name = f"tag_{marker_id}"
+
+            # Get 2D corners for this marker
+            corners_2d = corners[i][0]  # Shape: (4, 2)
+
+            # Solve PnP to get marker pose relative to camera
+            success, rvec, tvec = cv2.solvePnP(
+                self.marker_points_3d,  # 3D points in marker frame
+                corners_2d,              # 2D points in image
+                self.camera_matrix,
+                self.dist_coeffs,
+                flags=cv2.SOLVEPNP_IPPE_SQUARE
+            )
 
             if not success:
-                self.get_logger.warn(f"failed aruco position solve for arucotag {marker_id}")
+                self.get_logger().warn(f"Failed to solve pose for ArUco tag {marker_id}")
                 continue
 
-            # TODO: Invert
-            # TODO: Publish transform
-            # TODO: if first marker, set as map origin
-            if self.map_frame == None:
+
+            # Invert transformation: T_camera_marker -> T_marker_camera
+            R_camera_marker = cv2.Rodrigues(rvec)[0]  # Convert rvec to rotation matrix
+            R_marker_camera = R_camera_marker.T        # Invert rotation (transpose)
+            tvec_marker_camera = -R_marker_camera @ tvec  # Invert translation
+
+            # Convert inverted rotation matrix to quaternion
+            rot_marker_camera = Rotation.from_matrix(R_marker_camera)
+            quat_drone = rot_marker_camera.as_quat()  # Returns [x, y, z, w]
+
+            tvec_drone = tvec_marker_camera
+
+            # Skip publishing if transformation not implemented yet
+            if tvec_drone is None or quat_drone is None:
+                continue
+
+            # Publish transform: tag_N -> camera_link
+            aruco_to_drone = TransformStamped()
+            aruco_to_drone.header.frame_id = frame_name
+            aruco_to_drone.header.stamp = self.get_clock().now().to_msg()
+            aruco_to_drone.child_frame_id = "camera_link"
+
+            aruco_to_drone.transform.translation.x = float(tvec_drone[0])
+            aruco_to_drone.transform.translation.y = float(tvec_drone[1])
+            aruco_to_drone.transform.translation.z = float(tvec_drone[2])
+
+            # scipy returns [x, y, z, w] order
+            aruco_to_drone.transform.rotation.x = float(quat_drone[0])
+            aruco_to_drone.transform.rotation.y = float(quat_drone[1])
+            aruco_to_drone.transform.rotation.z = float(quat_drone[2])
+            aruco_to_drone.transform.rotation.w = float(quat_drone[3])
+
+            self.tf_broadcaster.sendTransform(aruco_to_drone)
+
+            # If first marker detected, set it as the map origin
+            if self.map_frame is None:
                 self.map_frame = f"tag_{marker_id}"
+
+                # Publish map -> tag_N transform (identity)
+                map_frame_origin = TransformStamped()
+                map_frame_origin.header.frame_id = "map"
+                map_frame_origin.header.stamp = self.get_clock().now().to_msg()
+                map_frame_origin.child_frame_id = frame_name
+
+                map_frame_origin.transform.translation.x = 0.0
+                map_frame_origin.transform.translation.y = 0.0
+                map_frame_origin.transform.translation.z = 0.0
+
+                # Identity quaternion
+                map_frame_origin.transform.rotation.x = 0.0
+                map_frame_origin.transform.rotation.y = 0.0
+                map_frame_origin.transform.rotation.z = 0.0
+                map_frame_origin.transform.rotation.w = 1.0
+
+                self.tf_broadcaster.sendTransform(map_frame_origin)
+                self.get_logger().info(f"Set map origin to tag_{marker_id}")
+
+
 
 
 
@@ -128,11 +210,13 @@ def main(args=None):
     node = TelloEnvironmentNode()
 
     try:
-        pass
+        node.get_logger().info("Tello Environment Node started. Waiting for camera frames...")
+        rclpy.spin(node)
     except KeyboardInterrupt:
-        pass
+        node.get_logger().info("Shutting down...")
     finally:
-        pass
+        node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

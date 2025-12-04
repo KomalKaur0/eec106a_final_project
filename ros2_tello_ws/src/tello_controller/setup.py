@@ -26,7 +26,7 @@ setup(
             'tello_flight = tello_controller.tello_flight_node:main',
             'tello_camera = tello_controller.tello_camera_node:main',
             'tello_ar_tag_mission_node = tello_controller.tello_ar_tag_mission_node:main',
-
+            'tello_environment = tello_controller.tello_environment_node:main',
         ],
     },
 )

@@ -86,3 +86,5 @@ devel_isolated/
 *.bag.active
 *.orig
 CATKIN_IGNORE
+# Frames from ros trees
+frames_*

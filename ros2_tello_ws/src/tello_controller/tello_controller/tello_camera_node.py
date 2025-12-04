@@ -100,7 +100,7 @@ class TelloCameraNode(Node):
             
             # Show window if enabled
             if self.show_window:
-                cv2.imshow('Tello Camera', frame)
+                cv2.imshow('Tello Camera', frame_rgb)
                 cv2.waitKey(1)
             
         except Exception as e:

@@ -1,0 +1,7 @@
+# Request
+string camera
+
+---
+# Response
+string camera
+bool success

@@ -12,6 +12,7 @@ import tf2_ros
 from tf2_ros import TransformBroadcaster
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from visualization_msgs.msg import MarkerArray
+from tello_interfaces.msg import TelloTelemetry
 
 from tello_controller import tello_constants as tc
 
@@ -58,13 +59,21 @@ class TelloEnvironmentNode(Node):
             10
         )
 
-        # TODO: Subscribe to raw drone position feed
-        # Needs to be implemented elsewhere first
-        
+        # Subscribe to drone telemetry
+        self.telemetry_subscriber = self.create_subscription(
+            TelloTelemetry,
+            '/tello/telemetry',
+            self.telemetry_callback,
+            10
+        )
+
         # State stuff
         self.bridge = CvBridge()
         self.tag_map = {}  # Persistent map of all seen tags
         self.map_frame = None  # First tag becomes map origin
+
+        # Latest telemetry data for sensor fusion
+        self.latest_telemetry = None
 
         # Camera intrinsics (from constants file)
         self.camera_matrix = tc.CAMERA_MATRIX
@@ -176,8 +185,25 @@ class TelloEnvironmentNode(Node):
         if len(current_observations) > 0 and self.map_frame is not None:
             self._publish_camera_pose(current_observations)
 
+    def telemetry_callback(self, msg: TelloTelemetry):
+        """Store latest telemetry for sensor fusion with AR tag odometry."""
+        if not msg.telemetry_valid:
+            self.get_logger().warn('Received invalid telemetry, ignoring')
+            return
 
+        self.latest_telemetry = msg
 
+        # Log periodically (every 90 messages = 3 sec at 30Hz)
+        if not hasattr(self, '_telemetry_count'):
+            self._telemetry_count = 0
+
+        self._telemetry_count += 1
+        if self._telemetry_count % 90 == 0:
+            self.get_logger().info(
+                f'Telemetry: height={msg.height:.1f}cm, '
+                f'battery={msg.battery}%, '
+                f'attitude=({msg.roll:.1f}, {msg.pitch:.1f}, {msg.yaw:.1f})°'
+            )
 
 
     def update_tag_map(self, observations):

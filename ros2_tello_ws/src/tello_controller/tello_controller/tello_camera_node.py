@@ -5,6 +5,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 from djitellopy import Tello
+from tello_interfaces.msg import TelloTelemetry
 import cv2
 import numpy as np
 
@@ -20,11 +21,18 @@ class TelloCameraNode(Node):
         
         # Create publisher for camera images
         self.image_pub = self.create_publisher(
-            Image, 
-            '/tello/camera/image_raw', 
+            Image,
+            '/tello/camera/image_raw',
             10
         )
-        
+
+        # Create publisher for telemetry data
+        self.telemetry_pub = self.create_publisher(
+            TelloTelemetry,
+            '/tello/telemetry',
+            10
+        )
+
         # Create CV Bridge for converting OpenCV images to ROS messages
         self.bridge = CvBridge()
         
@@ -97,12 +105,20 @@ class TelloCameraNode(Node):
             
             # Publish
             self.image_pub.publish(image_msg)
-            
+
+            # Publish telemetry alongside camera frame
+            if self.tello:
+                try:
+                    telemetry_msg = self.query_telemetry()
+                    self.telemetry_pub.publish(telemetry_msg)
+                except Exception as e:
+                    self.get_logger().warn(f'Failed to publish telemetry: {str(e)}')
+
             # Show window if enabled
             if self.show_window:
                 cv2.imshow('Tello Camera', frame_rgb)
                 cv2.waitKey(1)
-            
+
         except Exception as e:
             self.get_logger().error(f'Error publishing frame: {str(e)}')
     
@@ -110,7 +126,7 @@ class TelloCameraNode(Node):
         """Clean up resources"""
         if self.timer:
             self.timer.cancel()
-        
+
         if self.tello:
             try:
                 self.tello.streamoff()
@@ -118,8 +134,49 @@ class TelloCameraNode(Node):
                 self.get_logger().info('Video stream stopped')
             except:
                 pass
-        
+
         cv2.destroyAllWindows()
+
+    def query_telemetry(self) -> TelloTelemetry:
+        """Query all telemetry from Tello SDK and package into message."""
+        msg = TelloTelemetry()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'tello_base_link'
+        msg.telemetry_valid = True
+
+        try:
+            # Position (cm)
+            msg.height = float(self.tello.get_height())
+            msg.distance_tof = float(self.tello.get_distance_tof())
+            msg.barometer = float(self.tello.get_barometer())
+
+            # Velocity (cm/s)
+            msg.speed_x = float(self.tello.get_speed_x())
+            msg.speed_y = float(self.tello.get_speed_y())
+            msg.speed_z = float(self.tello.get_speed_z())
+
+            # Acceleration (0.001g)
+            msg.acceleration_x = float(self.tello.get_acceleration_x())
+            msg.acceleration_y = float(self.tello.get_acceleration_y())
+            msg.acceleration_z = float(self.tello.get_acceleration_z())
+
+            # Attitude (degrees)
+            msg.pitch = float(self.tello.get_pitch())
+            msg.roll = float(self.tello.get_roll())
+            msg.yaw = float(self.tello.get_yaw())
+
+            # Status
+            msg.battery = int(self.tello.get_battery())
+            msg.flight_time = int(self.tello.get_flight_time())
+            msg.temperature = float(self.tello.get_temperature())
+            msg.temperature_min = float(self.tello.get_lowest_temperature())
+            msg.temperature_max = float(self.tello.get_highest_temperature())
+
+        except Exception as e:
+            self.get_logger().warn(f'Telemetry query failed: {str(e)}')
+            msg.telemetry_valid = False
+
+        return msg
 
 
 def main(args=None):

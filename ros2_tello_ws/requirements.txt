@@ -1,0 +1,5 @@
+pytest
+djitellopy
+opencv-python
+numpy
+scipy

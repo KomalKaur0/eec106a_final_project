@@ -1,39 +1,53 @@
 #!/usr/bin/env python3
+"""
+Enhanced Tello Camera Node with Camera Info Publisher
+
+Publishes:
+- /tello/camera/image_raw (sensor_msgs/Image)
+- /tello/camera/camera_info (sensor_msgs/CameraInfo)
+- /tello/telemetry (tello_interfaces/TelloTelemetry)
+"""
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
 from djitellopy import Tello
 from tello_interfaces.msg import TelloTelemetry
 import cv2
 import numpy as np
 
+from tello_controller import tello_constants as tc
+
 
 class TelloCameraNode(Node):
     """
-    ROS2 Node for streaming Tello camera feed
-    Publishes to /tello/camera/image_raw topic
+    ROS2 Node for streaming Tello camera feed with calibration info
     """
     
     def __init__(self):
         super().__init__('tello_camera_node')
         
-        # Create publisher for camera images
+        # Create publishers
         self.image_pub = self.create_publisher(
             Image,
             '/tello/camera/image_raw',
             10
         )
 
-        # Create publisher for telemetry data
+        self.camera_info_pub = self.create_publisher(
+            CameraInfo,
+            '/tello/camera/camera_info',
+            10
+        )
+
         self.telemetry_pub = self.create_publisher(
             TelloTelemetry,
             '/tello/telemetry',
             10
         )
 
-        # Create CV Bridge for converting OpenCV images to ROS messages
+        # CV Bridge
         self.bridge = CvBridge()
         
         # Tello object
@@ -45,13 +59,55 @@ class TelloCameraNode(Node):
         
         # Declare parameters
         self.declare_parameter('publish_rate', 30.0)  # Hz
-        self.declare_parameter('show_window', True)
+        self.declare_parameter('show_window', False)  # Changed to False for headless
         
         self.publish_rate = self.get_parameter('publish_rate').value
         self.show_window = self.get_parameter('show_window').value
         
+        # Build camera info message (constant for all frames)
+        self.camera_info_msg = self._build_camera_info()
+        
         self.get_logger().info('Tello Camera Node Initialized')
         self.get_logger().info(f'Publish rate: {self.publish_rate} Hz')
+        
+    def _build_camera_info(self) -> CameraInfo:
+        """
+        Build CameraInfo message from calibration constants.
+        """
+        msg = CameraInfo()
+        
+        # Image dimensions
+        msg.height = tc.FRAME_HEIGHT
+        msg.width = tc.FRAME_WIDTH
+        
+        # Distortion model
+        msg.distortion_model = "plumb_bob"
+        msg.d = tc.DISTORTION_COEFFS.tolist()
+        
+        # Intrinsic camera matrix (3x3)
+        msg.k = tc.CAMERA_MATRIX.flatten().tolist()
+        
+        # Rectification matrix (identity for monocular)
+        msg.r = [1.0, 0.0, 0.0,
+                 0.0, 1.0, 0.0,
+                 0.0, 0.0, 1.0]
+        
+        # Projection matrix (3x4)
+        # P = [fx  0  cx  0]
+        #     [ 0 fy  cy  0]
+        #     [ 0  0   1  0]
+        msg.p = [tc.FOCAL_LENGTH_PX, 0.0, tc.PRINCIPAL_POINT_X, 0.0,
+                 0.0, tc.FOCAL_LENGTH_PX, tc.PRINCIPAL_POINT_Y, 0.0,
+                 0.0, 0.0, 1.0, 0.0]
+        
+        # Binning (no binning)
+        msg.binning_x = 0
+        msg.binning_y = 0
+        
+        # ROI (region of interest) - use full image
+        msg.roi.do_rectify = False
+        
+        return msg
         
     def connect_tello(self):
         """Connect to Tello and start video stream"""
@@ -81,7 +137,7 @@ class TelloCameraNode(Node):
             return False
     
     def publish_frame(self):
-        """Read frame and publish to ROS topic"""
+        """Read frame and publish to ROS topics"""
         if self.frame_read is None or self.frame_read.stopped:
             self.get_logger().warn('Frame reader not available')
             return
@@ -93,20 +149,24 @@ class TelloCameraNode(Node):
             if frame is None:
                 return
             
+            # Get timestamp
+            current_time = self.get_clock().now().to_msg()
+            
             # Convert BGR to RGB (ROS standard is RGB)
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
-            # Convert to ROS Image message
+            # Publish image
             image_msg = self.bridge.cv2_to_imgmsg(frame_rgb, encoding='rgb8')
-            
-            # Add timestamp
-            image_msg.header.stamp = self.get_clock().now().to_msg()
-            image_msg.header.frame_id = 'tello_camera'
-            
-            # Publish
+            image_msg.header.stamp = current_time
+            image_msg.header.frame_id = 'camera_link'
             self.image_pub.publish(image_msg)
+            
+            # Publish camera info (synchronized with image)
+            self.camera_info_msg.header.stamp = current_time
+            self.camera_info_msg.header.frame_id = 'camera_link'
+            self.camera_info_pub.publish(self.camera_info_msg)
 
-            # Publish telemetry alongside camera frame
+            # Publish telemetry
             if self.tello:
                 try:
                     telemetry_msg = self.query_telemetry()
@@ -141,7 +201,7 @@ class TelloCameraNode(Node):
         """Query all telemetry from Tello SDK and package into message."""
         msg = TelloTelemetry()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'tello_base_link'
+        msg.header.frame_id = 'base_link'
         msg.telemetry_valid = True
 
         try:
@@ -180,17 +240,12 @@ class TelloCameraNode(Node):
 
 
 def main(args=None):
-    # Initialize ROS2
     rclpy.init(args=args)
-    
-    # Create node
     node = TelloCameraNode()
     
     try:
-        # Connect to drone and start streaming
         if node.connect_tello():
             node.get_logger().info('Camera streaming started. Press Ctrl+C to stop.')
-            # Spin to keep publishing
             rclpy.spin(node)
         else:
             node.get_logger().error('Could not connect to Tello')
@@ -199,7 +254,6 @@ def main(args=None):
         node.get_logger().info('Shutting down...')
     
     finally:
-        # Cleanup
         node.cleanup()
         node.destroy_node()
         rclpy.shutdown()

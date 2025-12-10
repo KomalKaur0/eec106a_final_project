@@ -3,56 +3,47 @@ final project repo for ee106a FA25. team 9 project members: komal, max, cindy, l
 
 ## launch sequence
 
-### Terminal 1: Camera stream
-ros2 run tello_controller tello_camera_node
+### First, launch the environment node
+ros2 launch tello_controller tello_launch_simple.py
 
-### Terminal 2: Environment mapping (builds tag map)
-ros2 run tello_controller tello_environment_node
-
-### Terminal 3: Mission execution
+### Then in another terminal, run the mission
 ros2 run tello_controller tello_multi_ar_tag_mission_node
 
-### Terminal 4: RTAB-Map
-ros2 launch rtabmap_ros rtabmap.launch.py \
-    rgb_topic:=/tello/camera/image_raw \
-    camera_info_topic:=/tello/camera/camera_info \
-    frame_id:=camera_link \
-    approx_sync:=true
-
-## file structure
-tello_controller/
-├── tello_controller/
-│   ├── __init__.py
-│   ├── tello_constants.py
-│   ├── tello_camera_node.py (UPDATED)
-│   ├── tello_environment_node.py (UPDATED)
-│   ├── tello_multi_ar_tag_mission_node.py (UPDATED)
-│   └── (other nodes...)
-├── launch/
-│   └── tello_rtabmap.launch.py (NEW)
-├── rviz/
-│   └── tello_rtabmap.rviz (NEW)
-├── setup.py
-└── package.xml
+### Or with custom sequence
+ros2 run tello_controller tello_multi_ar_tag_mission_node \
+  --ros-args \
+  -p tag_sequence:=[0,2,1,3]
 
 ## TF tree
-map (AR tag origin)
- └─ odom
-     └─ base_link (drone body)
-         └─ camera_link (Tello camera)
+map
+
+ └── base_link
+
+      └── camera_link
+### coordinate convention
+map (world frame):
+
+X: Forward (from first tag's perspective)
+
+Y: Left
+
+Z: Up
+
+base link:
+
+X: Forward (drone's nose direction)
+
+Y: Left (drone's left side)
+
+Z: Up (drone's top)
+
+camera_link:
+
+X: Right (in image)
+
+Y: Down (in image)
+
+Z: Forward (into scene)
 
 ## Handoff
-Tello Camera
-    ↓ /tello/camera/image_raw (sensor_msgs/Image)
-    ↓ /tello/camera/camera_info (sensor_msgs/CameraInfo)
-    
-Environment Node
-    ↓ Detects AR tags → Builds map
-    ↓ /world/aruco_poses (visualization_msgs/MarkerArray)
-    ↓ /odom (nav_msgs/Odometry)
-    ↓ TF: map → odom → base_link → camera_link
-    
-RTAB-Map
-    ↓ Consumes images + odometry + TF
-    ↓ Builds 3D point cloud map
-    ↓ /rtabmap/cloud_map (sensor_msgs/PointCloud2)
+...

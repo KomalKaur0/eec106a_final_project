@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Enhanced Tello Environment Node with Odometry and Complete TF Tree
+Simplified Tello Environment Node - No RTAB-Map Dependencies
 
 Publishes:
 - /tello/drone_pose (geometry_msgs/PoseStamped) - Drone pose in map frame
 - /world/aruco_poses (visualization_msgs/MarkerArray) - All known AR tags
-- /odom (nav_msgs/Odometry) - Odometry for RTAB-Map
-- TF tree: map -> odom -> base_link -> camera_link
+- TF tree: map -> base_link -> camera_link
 """
 
 import rclpy
@@ -20,21 +19,16 @@ from scipy.spatial.transform import Rotation
 import tf2_ros
 from tf2_ros import TransformBroadcaster, StaticTransformBroadcaster
 from geometry_msgs.msg import PoseStamped, TransformStamped
-from nav_msgs.msg import Odometry
 from visualization_msgs.msg import MarkerArray, Marker
-from tello_interfaces.msg import TelloTelemetry
 
 from tello_controller import tello_constants as tc
 
 
 class TelloEnvironmentNode(Node):
     """
-    ROS2 Node for creating and publishing the environment containing the drone.
+    Simplified ROS2 Node for AR tag-based localization without RTAB-Map.
     
-    Combines:
-    - Visual odometry from AR tags
-    - IMU data from Tello telemetry
-    - Publishes complete TF tree for RTAB-Map
+    Creates a persistent map of AR tags and tracks drone pose relative to them.
     """
     
     def __init__(self):
@@ -52,19 +46,12 @@ class TelloEnvironmentNode(Node):
             '/world/aruco_poses',
             10
         )
-        
-        # Odometry publisher for RTAB-Map
-        self.odom_publisher = self.create_publisher(
-            Odometry,
-            '/odom',
-            10
-        )
 
         # TF broadcasters
         self.tf_broadcaster = TransformBroadcaster(self)
         self.static_tf_broadcaster = StaticTransformBroadcaster(self)
         
-        # Create subscribers
+        # Create subscriber
         self.camera_subscriber = self.create_subscription(
             Image,
             '/tello/camera/image_raw',
@@ -72,20 +59,11 @@ class TelloEnvironmentNode(Node):
             10
         )
 
-        self.telemetry_subscriber = self.create_subscription(
-            TelloTelemetry,
-            '/tello/telemetry',
-            self.telemetry_callback,
-            10
-        )
-
         # State
         self.bridge = CvBridge()
         self.tag_map = {}  # Persistent map of all seen tags
         self.map_frame = None  # First tag becomes map origin
-
-        # Latest telemetry data for sensor fusion
-        self.latest_telemetry = None
+        self.current_drone_pose = None  # (position, orientation, timestamp)
 
         # Camera intrinsics
         self.camera_matrix = tc.CAMERA_MATRIX
@@ -102,47 +80,32 @@ class TelloEnvironmentNode(Node):
             [-self.marker_size_m/2, -self.marker_size_m/2, 0],
         ], dtype=np.float32)
 
-        # Odometry state
-        self.last_odom_time = None
-        self.odom_seq = 0
-
-        # Camera pose for odometry
-        self.last_camera_pose = None  # (position, orientation, timestamp)
-
         # Publish static transforms
         self.publish_static_transforms()
 
-        # Timer to publish map transforms and odometry
-        self.map_timer = self.create_timer(0.033, self.publish_dynamic_data)  # 30 Hz
+        # Timer to publish visualizations
+        self.viz_timer = self.create_timer(0.1, self.publish_visualizations)  # 10 Hz
 
-        self.get_logger().info("Tello Environment Node initialized")
-        self.get_logger().info("Ready for RTAB-Map integration")
+        self.get_logger().info("Tello Environment Node initialized (No RTAB-Map)")
+        self.get_logger().info("Publishing: drone pose, AR tag map, TF tree")
 
     def publish_static_transforms(self):
         """
-        Publish static TF transforms that don't change.
+        Publish static TF transform: base_link -> camera_link
         
-        TF Tree: map -> odom -> base_link -> camera_link
-        
-        Static: base_link -> camera_link (camera mounted on drone)
+        TF Tree: map -> base_link -> camera_link
         """
-        transforms = []
-        
-        # base_link -> camera_link
-        # Tello camera is mounted facing forward, slightly downward
-        # Adjust these values based on your physical setup
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()
         t.header.frame_id = 'base_link'
         t.child_frame_id = 'camera_link'
         
-        # Camera is ~5cm forward, 0cm sideways, -2cm down from center
+        # Camera is ~5cm forward, 0cm sideways, -2cm down from drone center
         t.transform.translation.x = 0.05
         t.transform.translation.y = 0.0
         t.transform.translation.z = -0.02
         
         # Camera points forward with slight downward tilt (~15 degrees)
-        # This is a typical Tello camera orientation
         rot = Rotation.from_euler('xyz', [0, 15, 0], degrees=True)
         quat = rot.as_quat()
         t.transform.rotation.x = quat[0]
@@ -150,21 +113,19 @@ class TelloEnvironmentNode(Node):
         t.transform.rotation.z = quat[2]
         t.transform.rotation.w = quat[3]
         
-        transforms.append(t)
-        
-        self.static_tf_broadcaster.sendTransform(transforms)
+        self.static_tf_broadcaster.sendTransform(t)
         self.get_logger().info("Published static TF: base_link -> camera_link")
 
     def camera_callback(self, msg: Image):
         """
-        Process camera frames to detect AR tags and update pose.
+        Process camera frames to detect AR tags and update drone pose.
         """
         frame = self.bridge.imgmsg_to_cv2(msg)
         if frame is None:
             return
 
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        corners, ids, rejected = cv2.aruco.detectMarkers(
+        corners, ids, _ = cv2.aruco.detectMarkers(
             gray,
             self.aruco_dict,
             parameters=self.aruco_params
@@ -177,9 +138,9 @@ class TelloEnvironmentNode(Node):
 
         # Process each detected marker
         for i, marker_id in enumerate(ids.flatten()):
-            frame_name = f"tag_{marker_id}"
             corners_2d = corners[i][0]
 
+            # Solve PnP to get camera pose relative to marker
             success, rvec, tvec = cv2.solvePnP(
                 self.marker_points_3d,
                 corners_2d,
@@ -191,7 +152,7 @@ class TelloEnvironmentNode(Node):
             if not success:
                 continue
 
-            # Compute quality metrics
+            # Compute reprojection error for quality check
             projected_corners, _ = cv2.projectPoints(
                 self.marker_points_3d, rvec, tvec,
                 self.camera_matrix, self.dist_coeffs
@@ -203,7 +164,7 @@ class TelloEnvironmentNode(Node):
             if reprojection_error > 5.0:  # Skip low quality detections
                 continue
 
-            # Transform: camera pose in marker frame
+            # Transform to get marker pose in camera frame
             R_camera_marker = cv2.Rodrigues(rvec)[0]
             R_marker_camera = R_camera_marker.T
             tvec_marker_camera = -R_marker_camera @ tvec
@@ -218,27 +179,20 @@ class TelloEnvironmentNode(Node):
                 'timestamp': msg.header.stamp
             }
 
-        # Update persistent map
-        self.update_tag_map(current_observations)
-
-        # Publish camera pose and odometry
-        if len(current_observations) > 0 and self.map_frame is not None:
-            self._publish_camera_pose_and_odom(current_observations, msg.header.stamp)
-
-    def telemetry_callback(self, msg: TelloTelemetry):
-        """Store latest telemetry for sensor fusion."""
-        if not msg.telemetry_valid:
-            return
-        self.latest_telemetry = msg
+        # Update persistent map and compute drone pose
+        if len(current_observations) > 0:
+            self.update_tag_map(current_observations)
+            self.update_drone_pose(current_observations, msg.header.stamp)
 
     def update_tag_map(self, observations):
         """
-        Update the persistent tag map with new observations.
+        Update the persistent map of AR tags.
+        First seen tag becomes the map origin.
         """
         if len(observations) == 0:
             return
 
-        # Initialize map with first tag
+        # Initialize map with first tag if needed
         if self.map_frame is None:
             first_id = list(observations.keys())[0]
             self.map_frame = f"tag_{first_id}"
@@ -263,7 +217,7 @@ class TelloEnvironmentNode(Node):
 
     def _register_new_tag(self, new_id, new_obs, all_observations):
         """
-        Register a new tag using multi-tag registration.
+        Register a new tag by triangulating its position from known tags.
         """
         # Find a known tag in current observations
         known_tag_id = None
@@ -284,9 +238,11 @@ class TelloEnvironmentNode(Node):
         R_new_camera = new_obs['R']
         t_new_camera = new_obs['tvec']
 
+        # Invert to get camera->new transform
         R_camera_new = R_new_camera.T
         t_camera_new = (-R_camera_new @ t_new_camera).flatten()
 
+        # Compose: known->new = known->camera @ camera->new
         R_known_new = R_known_camera @ R_camera_new
         t_known_new = (R_known_camera @ t_camera_new + t_known_camera).flatten()
 
@@ -315,24 +271,27 @@ class TelloEnvironmentNode(Node):
             f"[{t_map_new[0]:.3f}, {t_map_new[1]:.3f}, {t_map_new[2]:.3f}]"
         )
 
-    def _publish_camera_pose_and_odom(self, observations, timestamp):
+    def update_drone_pose(self, observations, timestamp):
         """
-        Publish camera pose in map frame and compute odometry.
+        Compute and publish drone pose in map frame from visible tags.
         """
-        # Get camera pose from first visible known tag
+        # Compute camera pose from each visible known tag
         camera_poses = []
 
         for marker_id, obs in observations.items():
             if marker_id not in self.tag_map:
                 continue
 
+            # Camera pose in marker frame
             t_tag_camera = obs['tvec']
             R_tag_camera = obs['R']
 
+            # Tag pose in map frame
             tag_data = self.tag_map[marker_id]
             t_map_tag = tag_data['position']
             R_map_tag = tag_data['R']
 
+            # Compose: map->camera = map->tag @ tag->camera
             R_map_camera = R_map_tag @ R_tag_camera
             t_map_camera = (R_map_tag @ t_tag_camera + t_map_tag).flatten()
 
@@ -341,95 +300,53 @@ class TelloEnvironmentNode(Node):
         if len(camera_poses) == 0:
             return
 
-        t_map_camera, R_map_camera = camera_poses[0]
+        # Average multiple observations if available
+        if len(camera_poses) == 1:
+            t_map_camera, R_map_camera = camera_poses[0]
+        else:
+            # Simple averaging (could use more sophisticated fusion)
+            positions = np.array([p[0] for p in camera_poses])
+            t_map_camera = np.mean(positions, axis=0)
+            R_map_camera = camera_poses[0][1]  # Use first rotation (averaging rotations is complex)
+
+        # Convert to quaternion
         rot = Rotation.from_matrix(R_map_camera)
         quat_map_camera = rot.as_quat()
 
-        # Store for odometry computation
-        current_pose = (t_map_camera.copy(), quat_map_camera.copy(), timestamp)
+        # Camera pose is now in map frame
+        # For drone pose, we need to account for base_link->camera_link transform
+        # For simplicity, we'll publish camera pose as drone pose
+        # (The static TF handles the offset)
+        
+        self.current_drone_pose = (t_map_camera.copy(), quat_map_camera.copy(), timestamp)
 
-        # Compute velocity if we have a previous pose
-        velocity = np.array([0.0, 0.0, 0.0])
-        angular_velocity = np.array([0.0, 0.0, 0.0])
+        # Publish drone pose message
+        pose_msg = PoseStamped()
+        pose_msg.header.stamp = timestamp
+        pose_msg.header.frame_id = 'map'
+        
+        pose_msg.pose.position.x = float(t_map_camera[0])
+        pose_msg.pose.position.y = float(t_map_camera[1])
+        pose_msg.pose.position.z = float(t_map_camera[2])
+        
+        pose_msg.pose.orientation.x = float(quat_map_camera[0])
+        pose_msg.pose.orientation.y = float(quat_map_camera[1])
+        pose_msg.pose.orientation.z = float(quat_map_camera[2])
+        pose_msg.pose.orientation.w = float(quat_map_camera[3])
+        
+        self.drone_pose_publisher.publish(pose_msg)
 
-        if self.last_camera_pose is not None:
-            last_pos, last_quat, last_time = self.last_camera_pose
-            
-            # Compute time delta
-            dt_sec = (timestamp.sec - last_time.sec) + \
-                     (timestamp.nanosec - last_time.nanosec) * 1e-9
-            
-            if dt_sec > 0.001:  # Avoid division by very small numbers
-                # Linear velocity
-                velocity = (t_map_camera - last_pos) / dt_sec
-                
-                # Angular velocity (simplified)
-                last_rot = Rotation.from_quat(last_quat)
-                current_rot = Rotation.from_quat(quat_map_camera)
-                delta_rot = current_rot * last_rot.inv()
-                angular_velocity = delta_rot.as_rotvec() / dt_sec
+        # Publish TF: map -> base_link (using camera pose for now)
+        self._publish_drone_tf(t_map_camera, quat_map_camera, timestamp)
 
-        self.last_camera_pose = current_pose
-
-        # Publish odometry (camera_link as child frame)
-        self._publish_odometry(
-            t_map_camera, quat_map_camera,
-            velocity, angular_velocity,
-            timestamp
-        )
-
-        # Publish TF: map -> camera_link
-        self._publish_camera_tf(t_map_camera, quat_map_camera, timestamp)
-
-    def _publish_odometry(self, position, orientation, velocity, angular_velocity, timestamp):
+    def _publish_drone_tf(self, position, orientation, timestamp):
         """
-        Publish odometry message for RTAB-Map.
-        """
-        odom_msg = Odometry()
-        odom_msg.header.stamp = timestamp
-        odom_msg.header.frame_id = 'odom'
-        odom_msg.child_frame_id = 'base_link'
-
-        # Position
-        odom_msg.pose.pose.position.x = float(position[0])
-        odom_msg.pose.pose.position.y = float(position[1])
-        odom_msg.pose.pose.position.z = float(position[2])
-
-        # Orientation
-        odom_msg.pose.pose.orientation.x = float(orientation[0])
-        odom_msg.pose.pose.orientation.y = float(orientation[1])
-        odom_msg.pose.pose.orientation.z = float(orientation[2])
-        odom_msg.pose.pose.orientation.w = float(orientation[3])
-
-        # Velocity
-        odom_msg.twist.twist.linear.x = float(velocity[0])
-        odom_msg.twist.twist.linear.y = float(velocity[1])
-        odom_msg.twist.twist.linear.z = float(velocity[2])
-
-        odom_msg.twist.twist.angular.x = float(angular_velocity[0])
-        odom_msg.twist.twist.angular.y = float(angular_velocity[1])
-        odom_msg.twist.twist.angular.z = float(angular_velocity[2])
-
-        # Covariance (conservative estimates)
-        # Position covariance (m^2)
-        odom_msg.pose.covariance[0] = 0.01  # x
-        odom_msg.pose.covariance[7] = 0.01  # y
-        odom_msg.pose.covariance[14] = 0.01  # z
-        # Orientation covariance (rad^2)
-        odom_msg.pose.covariance[21] = 0.1  # roll
-        odom_msg.pose.covariance[28] = 0.1  # pitch
-        odom_msg.pose.covariance[35] = 0.1  # yaw
-
-        self.odom_publisher.publish(odom_msg)
-
-    def _publish_camera_tf(self, position, orientation, timestamp):
-        """
-        Publish TF transform: map -> camera_link
+        Publish TF transform: map -> base_link
         """
         transform = TransformStamped()
         transform.header.stamp = timestamp
         transform.header.frame_id = "map"
-        transform.child_frame_id = "camera_link"
+        transform.child_frame_id = "base_link"
 
         transform.transform.translation.x = float(position[0])
         transform.transform.translation.y = float(position[1])
@@ -442,46 +359,14 @@ class TelloEnvironmentNode(Node):
 
         self.tf_broadcaster.sendTransform(transform)
 
-    def publish_dynamic_data(self):
+    def publish_visualizations(self):
         """
-        Publish map transforms and marker visualizations.
-        Called at 30 Hz.
+        Publish marker visualizations for RViz.
         """
         if self.map_frame is None or len(self.tag_map) == 0:
             return
 
         current_time = self.get_clock().now().to_msg()
-
-        # Publish map -> odom (identity for now, could implement drift correction)
-        map_to_odom = TransformStamped()
-        map_to_odom.header.stamp = current_time
-        map_to_odom.header.frame_id = "map"
-        map_to_odom.child_frame_id = "odom"
-        map_to_odom.transform.rotation.w = 1.0
-        self.tf_broadcaster.sendTransform(map_to_odom)
-
-        # Publish odom -> base_link if we have camera pose
-        if self.last_camera_pose is not None:
-            pos, quat, _ = self.last_camera_pose
-            
-            # Since camera_link is static relative to base_link,
-            # we can compute base_link pose from camera pose
-            odom_to_base = TransformStamped()
-            odom_to_base.header.stamp = current_time
-            odom_to_base.header.frame_id = "odom"
-            odom_to_base.child_frame_id = "base_link"
-            
-            # For now, assume base_link = camera_link (will be corrected by static TF)
-            odom_to_base.transform.translation.x = float(pos[0])
-            odom_to_base.transform.translation.y = float(pos[1])
-            odom_to_base.transform.translation.z = float(pos[2])
-            
-            odom_to_base.transform.rotation.x = float(quat[0])
-            odom_to_base.transform.rotation.y = float(quat[1])
-            odom_to_base.transform.rotation.z = float(quat[2])
-            odom_to_base.transform.rotation.w = float(quat[3])
-            
-            self.tf_broadcaster.sendTransform(odom_to_base)
 
         # Publish marker array for visualization
         marker_array = MarkerArray()
@@ -522,7 +407,25 @@ class TelloEnvironmentNode(Node):
                 marker.color.b = 1.0
             marker.color.a = 0.8
             
+            # Add text label
             marker_array.markers.append(marker)
+            
+            # Add text marker for ID
+            text_marker = Marker()
+            text_marker.header = marker.header
+            text_marker.ns = "aruco_labels"
+            text_marker.id = int(marker_id) + 1000  # Offset to avoid ID collision
+            text_marker.type = Marker.TEXT_VIEW_FACING
+            text_marker.action = Marker.ADD
+            text_marker.pose = marker.pose
+            text_marker.pose.position.z += 0.1  # Offset text above marker
+            text_marker.scale.z = 0.05  # Text size
+            text_marker.color.r = 1.0
+            text_marker.color.g = 1.0
+            text_marker.color.b = 1.0
+            text_marker.color.a = 1.0
+            text_marker.text = f"ID: {marker_id}"
+            marker_array.markers.append(text_marker)
         
         self.aruco_pose_publisher.publish(marker_array)
 

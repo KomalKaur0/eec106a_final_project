@@ -6,74 +6,130 @@ import math
 import rclpy
 from rclpy.node import Node
 from djitellopy import Tello
-import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+
+from geometry_msgs.msg import PoseStamped, Quaternion
+from visualization_msgs.msg import MarkerArray, Marker
+from scipy.spatial.transform import Rotation
 
 
 class TelloMultiArTagMissionNode(Node):
     """
-    ROS2 Node for multi-ArUco-tag-guided Tello mission.
-
-    Pipeline:
-      1. Connect and takeoff
-      2. Search and detect ALL visible ArUco tags
-      3. For each tag:
-           - Compute angle, distance, and lateral offset
-           - Show planned path
-      4. Allow user to select which tag to visit
-      5. Execute path to selected tag
-      6. Optionally visit next tag or land
+    ROS2 Node for multi-ArUco-tag-guided Tello mission using global map frame.
+    
+    This node:
+    1. Subscribes to the environment node's tag map and drone pose
+    2. Plans paths in the global map frame (not camera-relative)
+    3. Commands the drone to visit selected tags
+    4. Works with RTAB-Map for 3D environment mapping
+    
+    Prerequisites:
+    - tello_camera_node must be running
+    - tello_environment_node must be running (builds the map)
     """
 
     def __init__(self):
         super().__init__("tello_multi_ar_tag_mission_node")
 
         # ---------------- Parameters ----------------
-        self.declare_parameter("hover_height", 70)
-        self.declare_parameter("marker_ids", [0, 1, 2, 3])  # List of ArUco IDs to track
-        self.declare_parameter("tag_size_cm", 15.0)
-        self.declare_parameter("search_timeout", 40.0)
-        self.declare_parameter("show_debug_window", True)
-        self.declare_parameter("visit_all_tags", False)  # If True, visit all detected tags
+        self.declare_parameter("marker_ids", [0, 1, 2, 3])
+        self.declare_parameter("approach_distance_m", 0.5)  # Stop 50cm from tag
+        self.declare_parameter("visit_all_tags", False)
+        self.declare_parameter("max_flight_speed_cm", 100)  # Conservative speed
+        self.declare_parameter("position_tolerance_m", 0.15)  # 15cm position tolerance
 
-        self.hover_height = int(self.get_parameter("hover_height").value)
         self.marker_ids = self.get_parameter("marker_ids").value
-        self.tag_size_cm = float(self.get_parameter("tag_size_cm").value)
-        self.search_timeout = float(self.get_parameter("search_timeout").value)
-        self.show_debug = bool(self.get_parameter("show_debug_window").value)
+        self.approach_distance_m = float(self.get_parameter("approach_distance_m").value)
         self.visit_all_tags = bool(self.get_parameter("visit_all_tags").value)
-
-        self.hover_height = max(40, min(self.hover_height, 150))
-        self.focal_length_px = 920.0
+        self.max_speed_cm = int(self.get_parameter("max_flight_speed_cm").value)
+        self.position_tolerance_m = float(self.get_parameter("position_tolerance_m").value)
 
         self.get_logger().info(
-            f"Tello Multi-AR Tag Mission Node initialized\n"
-            f"  Hover height: {self.hover_height} cm\n"
+            f"Tello Multi-AR Tag Mission Node (Global Frame) initialized\n"
             f"  Marker IDs: {self.marker_ids}\n"
-            f"  Tag size: {self.tag_size_cm} cm\n"
-            f"  Search timeout: {self.search_timeout} s\n"
-            f"  Visit all tags: {self.visit_all_tags}"
+            f"  Approach distance: {self.approach_distance_m} m\n"
+            f"  Visit all tags: {self.visit_all_tags}\n"
+            f"  Max speed: {self.max_speed_cm} cm/s"
         )
 
-        # Tello & video
+        # Tello connection
         self.tello = None
-        self.frame_read = None
         self.connected = False
-
-        # ArUco setup
-        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-        self.aruco_params = cv2.aruco.DetectorParameters()
 
         # Track visited tags
         self.visited_tags = set()
 
+        # State from environment node
+        self.known_tags = {}  # {marker_id: {'position': [x,y,z], 'orientation': [x,y,z,w]}}
+        self.current_drone_pose = None  # PoseStamped in map frame
+        self.map_initialized = False
+
+        # Create subscribers
+        self.tag_map_subscriber = self.create_subscription(
+            MarkerArray,
+            '/world/aruco_poses',
+            self.tag_map_callback,
+            10
+        )
+
+        self.drone_pose_subscriber = self.create_subscription(
+            PoseStamped,
+            '/tello/drone_pose',
+            self.drone_pose_callback,
+            10
+        )
+
+        self.get_logger().info("Waiting for environment node data...")
+
     # ------------------------------------------------
-    # Tello connection & video
+    # Subscribers for environment data
+    # ------------------------------------------------
+
+    def tag_map_callback(self, msg: MarkerArray):
+        """
+        Receive the global map of all known AR tags from environment node.
+        """
+        for marker in msg.markers:
+            # Extract marker ID from namespace or id
+            marker_id = marker.id
+            
+            if marker_id not in self.marker_ids:
+                continue  # Only track configured markers
+            
+            self.known_tags[marker_id] = {
+                'position': np.array([
+                    marker.pose.position.x,
+                    marker.pose.position.y,
+                    marker.pose.position.z
+                ]),
+                'orientation': np.array([
+                    marker.pose.orientation.x,
+                    marker.pose.orientation.y,
+                    marker.pose.orientation.z,
+                    marker.pose.orientation.w
+                ])
+            }
+        
+        if len(self.known_tags) > 0 and not self.map_initialized:
+            self.map_initialized = True
+            self.get_logger().info(
+                f"Map initialized with {len(self.known_tags)} tags: "
+                f"{list(self.known_tags.keys())}"
+            )
+
+    def drone_pose_callback(self, msg: PoseStamped):
+        """
+        Receive current drone pose in global map frame from environment node.
+        """
+        self.current_drone_pose = msg
+
+    # ------------------------------------------------
+    # Tello connection
     # ------------------------------------------------
 
     def connect_tello(self) -> bool:
-        """Connect to Tello and start video stream."""
+        """Connect to Tello drone."""
         try:
             self.get_logger().info("Connecting to Tello...")
             self.tello = Tello()
@@ -81,317 +137,227 @@ class TelloMultiArTagMissionNode(Node):
 
             battery = self.tello.get_battery()
             self.get_logger().info(f"Connected. Battery: {battery}%")
+            
             if battery < 20:
                 self.get_logger().error("Battery too low (<20%). Aborting flight.")
                 return False
 
-            self.get_logger().info("Starting video stream...")
-            self.tello.streamon()
-            self.frame_read = self.tello.get_frame_read()
-            time.sleep(1.0)
-
             self.connected = True
-            self.get_logger().info("Video stream started.")
             return True
 
         except Exception as e:
             self.get_logger().error(f"Failed to connect to Tello: {e}")
             return False
 
-    def get_frame(self):
-        """Safely get the latest frame from Tello camera."""
-        if self.frame_read is None:
-            return None
-        frame = self.frame_read.frame
-        if frame is None:
-            return None
-        return frame.copy()
-
     # ------------------------------------------------
-    # ArUco detection (Multi-tag)
+    # Wait for environment initialization
     # ------------------------------------------------
 
-    def detect_all_markers(self, frame):
+    def wait_for_map_initialization(self, timeout_sec=30.0):
         """
-        Detect ALL ArUco markers in the configured list.
-
-        Returns:
-            List of dicts: [
-                {
-                    'id': marker_id,
-                    'cx': center_x,
-                    'cy': center_y,
-                    'width_px': tag_width_px,
-                    'corners': marker_corners
-                },
-                ...
-            ]
+        Wait for the environment node to detect at least one AR tag.
+        This ensures we have a map frame before starting navigation.
         """
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        corners, ids, _ = cv2.aruco.detectMarkers(
-            gray,
-            self.aruco_dict,
-            parameters=self.aruco_params
-        )
-
-        detected = []
-
-        if ids is None or len(ids) == 0:
-            return detected
-
-        ids = ids.flatten()
-
-        for i, mid in enumerate(ids):
-            if mid in self.marker_ids:
-                marker_corners = corners[i][0]  # shape (4,2)
-
-                # Center
-                c_x = int(np.mean(marker_corners[:, 0]))
-                c_y = int(np.mean(marker_corners[:, 1]))
-
-                # Approximate pixel width
-                w_px = int(np.linalg.norm(marker_corners[0] - marker_corners[1]))
-
-                detected.append({
-                    'id': int(mid),
-                    'cx': c_x,
-                    'cy': c_y,
-                    'width_px': w_px,
-                    'corners': marker_corners
-                })
-
-        return detected
-
-    def draw_multi_debug(self, frame, detections):
-        """Draw detection overlays for all detected tags."""
-        if frame is None:
-            return
-
-        h, w = frame.shape[:2]
-        cx_img, cy_img = w // 2, h // 2
-
-        # Image center
-        cv2.circle(frame, (cx_img, cy_img), 4, (255, 0, 0), -1)
-
-        # Color map for different tags
-        colors = [
-            (0, 255, 0),    # Green
-            (255, 0, 0),    # Blue
-            (0, 255, 255),  # Yellow
-            (255, 0, 255),  # Magenta
-            (0, 165, 255),  # Orange
-        ]
-
-        for idx, det in enumerate(detections):
-            color = colors[idx % len(colors)]
-            
-            # Marker outline
-            cv2.polylines(
-                frame,
-                [det['corners'].astype(np.int32)],
-                True,
-                color,
-                2
-            )
-
-            # Marker center
-            cx, cy = det['cx'], det['cy']
-            cv2.circle(frame, (cx, cy), 5, color, -1)
-            cv2.line(frame, (cx_img, cy_img), (cx, cy), color, 2)
-
-            # Label with ID
-            visited_str = " (visited)" if det['id'] in self.visited_tags else ""
-            label = f"ID:{det['id']}{visited_str}"
-            cv2.putText(
-                frame,
-                label,
-                (cx + 10, cy - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                color,
-                2
-            )
-
-        # Title
-        cv2.putText(
-            frame,
-            f'Multi-AR Tag - {len(detections)} detected',
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 255),
-            2
-        )
-
-        cv2.imshow('Tello Multi AR Tag', frame)
-        cv2.waitKey(1)
-
-    # ------------------------------------------------
-    # Movement helpers
-    # ------------------------------------------------
-
-    def safe_move(self, command: str, distance_cm: int):
-        """Wrapper for move commands with logging and small delays."""
-        distance_cm = int(max(20, min(distance_cm, 200)))
-        self.get_logger().info(f"Command: {command} {distance_cm} cm")
-        try:
-            if command == 'forward':
-                self.tello.move_forward(distance_cm)
-            elif command == 'back':
-                self.tello.move_back(distance_cm)
-            elif command == 'left':
-                self.tello.move_left(distance_cm)
-            elif command == 'right':
-                self.tello.move_right(distance_cm)
-            elif command == 'up':
-                self.tello.move_up(distance_cm)
-            elif command == 'down':
-                self.tello.move_down(distance_cm)
-            else:
-                self.get_logger().warn(f"Unknown move command: {command}")
-                return
-            time.sleep(1.2)
-        except Exception as e:
-            self.get_logger().error(f"Move {command} failed: {e}")
-
-    # ------------------------------------------------
-    # Search for markers
-    # ------------------------------------------------
-
-    def search_for_markers(self):
-        """
-        Rotate and search until at least one marker is found or timeout.
-
-        Returns:
-            List of detections or None
-        """
-        self.get_logger().info("Searching for markers by rotating...")
+        self.get_logger().info("Waiting for map initialization (need at least 1 tag)...")
         start_time = time.time()
-        last_rotate = 0.0
-        rotate_interval = 2.0
-
-        while time.time() - start_time < self.search_timeout:
-            frame = self.get_frame()
-            if frame is None:
-                continue
-
-            detections = self.detect_all_markers(frame)
+        
+        rate = self.create_rate(10)  # 10 Hz
+        
+        while time.time() - start_time < timeout_sec:
+            if self.map_initialized and self.current_drone_pose is not None:
+                self.get_logger().info("✓ Map initialized and drone pose available")
+                return True
             
-            if len(detections) > 0:
-                self.get_logger().info(
-                    f"Found {len(detections)} marker(s): "
-                    f"{[d['id'] for d in detections]}"
-                )
-                if self.show_debug:
-                    self.draw_multi_debug(frame, detections)
-                return detections
-
-            # No markers yet; rotate
-            if time.time() - last_rotate > rotate_interval:
-                self.get_logger().info("Rotating clockwise to search...")
-                try:
-                    self.tello.rotate_clockwise(20)
-                except Exception as e:
-                    self.get_logger().error(f"Rotate failed: {e}")
-                last_rotate = time.time()
-
-            if self.show_debug:
-                self.draw_multi_debug(frame, [])
-
-        self.get_logger().warn("Search timeout reached – no markers found.")
-        return None
+            rclpy.spin_once(self, timeout_sec=0.1)
+            rate.sleep()
+        
+        self.get_logger().error("Timeout waiting for map initialization")
+        return False
 
     # ------------------------------------------------
-    # Path planning for multiple tags
+    # Path planning in global frame
     # ------------------------------------------------
 
-    def plan_path_for_tag(self, detection, frame_shape):
+    def plan_path_to_tag_global(self, tag_id):
         """
-        Compute angle and distance to a specific tag.
-
+        Plan path from current drone pose to target tag in global map frame.
+        
         Returns:
-            dict with keys: angle_deg, X, Y, Z
+            dict with keys:
+                - 'distance_m': horizontal distance to tag
+                - 'angle_rad': required heading change
+                - 'angle_deg': required heading change in degrees
+                - 'dz_m': vertical distance to tag
+                - 'target_pos': target position [x, y, z]
         """
-        h, w = frame_shape[:2]
-        img_cx, img_cy = w // 2, h // 2
-
-        dx_px = float(detection['cx'] - img_cx)
-        dy_px = float(detection['cy'] - img_cy)
-        w_px = detection['width_px']
-
-        f = self.focal_length_px
-        W = self.tag_size_cm
-
-        # Estimate range
-        if w_px <= 0:
-            Z = 50.0
+        if tag_id not in self.known_tags:
+            self.get_logger().warn(f"Tag {tag_id} not in known tags")
+            return None
+        
+        if self.current_drone_pose is None:
+            self.get_logger().warn("Current drone pose not available")
+            return None
+        
+        # Current drone position in map frame
+        drone_pos = np.array([
+            self.current_drone_pose.pose.position.x,
+            self.current_drone_pose.pose.position.y,
+            self.current_drone_pose.pose.position.z
+        ])
+        
+        # Current drone orientation (yaw)
+        drone_quat = self.current_drone_pose.pose.orientation
+        drone_rot = Rotation.from_quat([
+            drone_quat.x, drone_quat.y, drone_quat.z, drone_quat.w
+        ])
+        drone_euler = drone_rot.as_euler('xyz', degrees=False)
+        current_yaw = drone_euler[2]  # Yaw in radians
+        
+        # Target tag position
+        tag_pos = self.known_tags[tag_id]['position']
+        
+        # Compute target position (approach_distance away from tag)
+        # Calculate direction from tag to drone, then back off
+        dx_full = tag_pos[0] - drone_pos[0]
+        dy_full = tag_pos[1] - drone_pos[1]
+        dist_full = math.sqrt(dx_full**2 + dy_full**2)
+        
+        if dist_full > self.approach_distance_m:
+            # Target is approach_distance away from tag
+            approach_ratio = (dist_full - self.approach_distance_m) / dist_full
+            target_pos = drone_pos + np.array([dx_full, dy_full, 0]) * approach_ratio
+            target_pos[2] = tag_pos[2]  # Match tag height
         else:
-            Z = (W * f) / float(w_px)
-
-        # Horizontal angle
-        angle_rad = math.atan2(dx_px, f)
-        angle_deg = angle_rad * 180.0 / math.pi
-
-        # Planar offsets
-        X = Z * math.sin(angle_rad)
-        Y = Z * math.cos(angle_rad)
-
+            # Already within approach distance
+            target_pos = tag_pos.copy()
+        
+        # Compute required movement
+        dx = target_pos[0] - drone_pos[0]
+        dy = target_pos[1] - drone_pos[1]
+        dz = target_pos[2] - drone_pos[2]
+        
+        distance_horizontal = math.sqrt(dx**2 + dy**2)
+        
+        # Required heading in map frame
+        target_yaw = math.atan2(dy, dx)
+        
+        # Heading change needed
+        angle_change = self._normalize_angle(target_yaw - current_yaw)
+        
         return {
-            'angle_deg': angle_deg,
-            'X': X,
-            'Y': Y,
-            'Z': Z
+            'distance_m': distance_horizontal,
+            'angle_rad': angle_change,
+            'angle_deg': math.degrees(angle_change),
+            'dz_m': dz,
+            'target_pos': target_pos,
+            'current_pos': drone_pos
         }
+
+    def _normalize_angle(self, angle_rad):
+        """Normalize angle to [-pi, pi]"""
+        while angle_rad > math.pi:
+            angle_rad -= 2 * math.pi
+        while angle_rad < -math.pi:
+            angle_rad += 2 * math.pi
+        return angle_rad
+
+    # ------------------------------------------------
+    # Visualization
+    # ------------------------------------------------
 
     def show_multi_path_graph(self, tag_paths):
         """
-        Show a 2D graph of planned paths to all detected tags.
+        Show 2D top-down view of planned paths to all tags in map frame.
         
-        tag_paths: list of dicts with keys: id, angle_deg, X, Y, Z
+        tag_paths: list of dicts with path planning results
         """
-        self.get_logger().info("Showing planned paths to all detected tags...")
-
-        plt.figure(figsize=(8, 8))
+        plt.figure(figsize=(10, 10))
         
         colors = ['g', 'b', 'r', 'm', 'c', 'y']
         
-        for idx, path in enumerate(tag_paths):
+        # Plot each tag and path
+        for idx, path_info in enumerate(tag_paths):
+            if path_info['path'] is None:
+                continue
+                
             color = colors[idx % len(colors)]
-            marker_id = path['id']
-            X, Y = path['X'], path['Y']
+            tag_id = path_info['id']
+            path = path_info['path']
             
-            visited_marker = '*' if marker_id in self.visited_tags else 'o'
+            current = path['current_pos']
+            target = path['target_pos']
             
-            plt.plot([0, X], [0, Y], f"{color}-{visited_marker}", 
-                    label=f"Tag ID {marker_id}")
-            plt.text(X, Y, f" Tag {marker_id}", fontsize=10)
-
-        plt.scatter([0], [0], c='black', s=100, marker='D', label="Drone")
-        plt.title("Planned Paths to All Detected Tags")
-        plt.xlabel("Right (+) cm")
-        plt.ylabel("Forward (+) cm")
-        plt.grid(True)
+            visited_marker = '*' if tag_id in self.visited_tags else 'o'
+            
+            # Draw path line
+            plt.plot([current[0], target[0]], 
+                    [current[1], target[1]], 
+                    f"{color}-{visited_marker}",
+                    linewidth=2,
+                    label=f"Tag {tag_id}")
+            
+            # Label target
+            plt.text(target[0], target[1], f" Tag {tag_id}", 
+                    fontsize=10, color=color)
+        
+        # Plot drone current position
+        if self.current_drone_pose:
+            drone_x = self.current_drone_pose.pose.position.x
+            drone_y = self.current_drone_pose.pose.position.y
+            plt.scatter([drone_x], [drone_y], 
+                       c='black', s=200, marker='D', 
+                       label="Drone", zorder=10)
+            
+            # Draw drone heading
+            drone_quat = self.current_drone_pose.pose.orientation
+            drone_rot = Rotation.from_quat([
+                drone_quat.x, drone_quat.y, drone_quat.z, drone_quat.w
+            ])
+            yaw = drone_rot.as_euler('xyz')[2]
+            arrow_len = 0.2
+            dx_arrow = arrow_len * math.cos(yaw)
+            dy_arrow = arrow_len * math.sin(yaw)
+            plt.arrow(drone_x, drone_y, dx_arrow, dy_arrow,
+                     head_width=0.1, head_length=0.05, 
+                     fc='black', ec='black')
+        
+        plt.title("Global Map - Planned Paths to Tags", fontsize=14)
+        plt.xlabel("X (meters)", fontsize=12)
+        plt.ylabel("Y (meters)", fontsize=12)
+        plt.grid(True, alpha=0.3)
         plt.axis("equal")
         plt.legend()
-
+        
         plt.show(block=False)
         plt.pause(0.1)
+
+    # ------------------------------------------------
+    # Tag selection
+    # ------------------------------------------------
 
     def select_target_tag(self, tag_paths):
         """
         Let user select which tag to visit.
         
         Returns:
-            Selected tag dict or None
+            Selected tag_path dict or None
         """
-        print("\n" + "="*50)
-        print("DETECTED TAGS:")
-        for idx, path in enumerate(tag_paths):
-            visited = " (VISITED)" if path['id'] in self.visited_tags else ""
-            print(f"  [{idx}] Tag ID {path['id']}: "
-                  f"Angle={path['angle_deg']:.1f}°, "
-                  f"Distance={path['Z']:.1f}cm{visited}")
-        print("="*50)
+        print("\n" + "="*60)
+        print("AVAILABLE TAGS IN MAP:")
+        for idx, path_info in enumerate(tag_paths):
+            tag_id = path_info['id']
+            path = path_info['path']
+            
+            if path is None:
+                print(f"  [{idx}] Tag {tag_id}: PATH UNAVAILABLE")
+                continue
+            
+            visited = " (VISITED)" if tag_id in self.visited_tags else ""
+            print(f"  [{idx}] Tag {tag_id}: "
+                  f"Distance={path['distance_m']:.2f}m, "
+                  f"Heading change={path['angle_deg']:.1f}°, "
+                  f"Height change={path['dz_m']:.2f}m{visited}")
+        print("="*60)
         
         while True:
             choice = input("\nEnter tag number to visit (or 'q' to land): ").strip()
@@ -402,148 +368,207 @@ class TelloMultiArTagMissionNode(Node):
             try:
                 idx = int(choice)
                 if 0 <= idx < len(tag_paths):
-                    return tag_paths[idx]
+                    if tag_paths[idx]['path'] is not None:
+                        return tag_paths[idx]
+                    else:
+                        print("That tag has no valid path")
                 else:
                     print(f"Invalid choice. Enter 0-{len(tag_paths)-1}")
             except ValueError:
                 print("Invalid input. Enter a number or 'q'")
 
     # ------------------------------------------------
-    # Execute path to specific tag
+    # Navigation execution
     # ------------------------------------------------
 
-    def execute_path_to_tag(self, path):
+    def execute_path_to_tag(self, path_info):
         """
-        Navigate to a specific tag.
+        Execute navigation to target tag using global path planning.
         
-        path: dict with keys: angle_deg, X, Y, Z
+        Uses closed-loop control: repeatedly check position and adjust.
         """
-        angle_deg = path['angle_deg']
-        X = path['X']
-        Y = path['Y']
-
-        # Step 1: Rotate to face the tag
-        if angle_deg > 5.0:
-            self.get_logger().info(f"Rotating clockwise by {angle_deg:.1f} deg")
-            try:
-                self.tello.rotate_clockwise(int(angle_deg))
-            except Exception as e:
-                self.get_logger().error(f"Rotate clockwise failed: {e}")
-        elif angle_deg < -5.0:
-            self.get_logger().info(f"Rotating counter-clockwise by {-angle_deg:.1f} deg")
-            try:
-                self.tello.rotate_counter_clockwise(int(-angle_deg))
-            except Exception as e:
-                self.get_logger().error(f"Rotate ccw failed: {e}")
-        else:
-            self.get_logger().info("Yaw angle small, no rotation needed.")
-
-        time.sleep(1.0)
-
-        # Step 2: Move forward
-        forward_cm = int(max(0.0, min(abs(Y), 150.0)))
-        if forward_cm > 20:
-            self.get_logger().info(f"Moving forward {forward_cm} cm toward tag.")
-            self.safe_move("forward", forward_cm)
-        else:
-            self.get_logger().info("Forward distance small; skipping forward move.")
-
-        self.get_logger().info(f"Arrived at tag ID {path['id']}")
-        self.visited_tags.add(path['id'])
+        tag_id = path_info['id']
+        path = path_info['path']
+        
+        self.get_logger().info(f"Navigating to Tag {tag_id}...")
+        
+        max_iterations = 10
+        iteration = 0
+        
+        while iteration < max_iterations:
+            iteration += 1
+            
+            # Recompute path with latest position
+            rclpy.spin_once(self, timeout_sec=0.1)
+            current_path = self.plan_path_to_tag_global(tag_id)
+            
+            if current_path is None:
+                self.get_logger().error("Lost tracking, aborting navigation")
+                return False
+            
+            distance = current_path['distance_m']
+            angle_deg = current_path['angle_deg']
+            dz_m = current_path['dz_m']
+            
+            self.get_logger().info(
+                f"Iteration {iteration}: dist={distance:.2f}m, "
+                f"angle={angle_deg:.1f}°, dz={dz_m:.2f}m"
+            )
+            
+            # Check if arrived
+            if distance < self.position_tolerance_m and abs(dz_m) < 0.1:
+                self.get_logger().info(f"✓ Arrived at Tag {tag_id}")
+                self.visited_tags.add(tag_id)
+                return True
+            
+            # Step 1: Rotate to face target
+            if abs(angle_deg) > 10.0:
+                rotate_deg = int(np.clip(angle_deg, -90, 90))
+                self.get_logger().info(f"Rotating {rotate_deg}°")
+                
+                try:
+                    if rotate_deg > 0:
+                        self.tello.rotate_clockwise(abs(rotate_deg))
+                    else:
+                        self.tello.rotate_counter_clockwise(abs(rotate_deg))
+                    time.sleep(1.5)
+                except Exception as e:
+                    self.get_logger().error(f"Rotation failed: {e}")
+                
+                continue  # Re-evaluate after rotation
+            
+            # Step 2: Adjust height if needed
+            if abs(dz_m) > 0.15:
+                dz_cm = int(np.clip(dz_m * 100, -100, 100))
+                self.get_logger().info(f"Adjusting height {dz_cm}cm")
+                
+                try:
+                    if dz_cm > 20:
+                        self.tello.move_up(min(abs(dz_cm), 100))
+                    elif dz_cm < -20:
+                        self.tello.move_down(min(abs(dz_cm), 100))
+                    time.sleep(1.2)
+                except Exception as e:
+                    self.get_logger().error(f"Height adjustment failed: {e}")
+                
+                continue
+            
+            # Step 3: Move forward toward target
+            if distance > self.position_tolerance_m:
+                # Conservative forward movement
+                forward_cm = int(np.clip(distance * 100, 20, 150))
+                self.get_logger().info(f"Moving forward {forward_cm}cm")
+                
+                try:
+                    self.tello.move_forward(forward_cm)
+                    time.sleep(1.5)
+                except Exception as e:
+                    self.get_logger().error(f"Forward movement failed: {e}")
+                    return False
+        
+        self.get_logger().warn(f"Max iterations reached for Tag {tag_id}")
+        return False
 
     # ------------------------------------------------
-    # Full mission
+    # Main mission
     # ------------------------------------------------
 
     def execute_mission(self):
-        """Full mission: takeoff, search, plan, select, execute."""
+        """
+        Full mission: takeoff, navigate to tags using global map, land.
+        """
         if not self.connected:
-            self.get_logger().error("Not connected to Tello.")
+            self.get_logger().error("Not connected to Tello")
             return False
-
+        
+        # Wait for map initialization
+        if not self.wait_for_map_initialization():
+            self.get_logger().error("Map not initialized, cannot start mission")
+            return False
+        
         try:
             # Takeoff
             self.get_logger().info("Taking off...")
             self.tello.takeoff()
             time.sleep(3.0)
-            self.get_logger().info("Takeoff complete.")
-
-            # Main loop: search and visit tags
+            self.get_logger().info("✓ Takeoff complete")
+            
+            # Give environment node time to get initial pose
+            self.get_logger().info("Stabilizing and getting initial pose...")
+            for _ in range(30):  # 3 seconds at 10Hz
+                rclpy.spin_once(self, timeout_sec=0.1)
+                time.sleep(0.1)
+            
+            # Main navigation loop
             while True:
-                # Search for markers
-                detections = self.search_for_markers()
-                if detections is None or len(detections) == 0:
-                    self.get_logger().warn("No markers found; landing.")
-                    break
-
-                # Get current frame for planning
-                frame = self.get_frame()
-                if frame is None:
-                    self.get_logger().error("Could not grab frame; landing.")
-                    break
-
-                # Plan paths to all detected tags
+                # Get current state
+                rclpy.spin_once(self, timeout_sec=0.1)
+                
+                # Plan paths to all known tags
                 tag_paths = []
-                for det in detections:
-                    path = self.plan_path_for_tag(det, frame.shape)
-                    path['id'] = det['id']
-                    tag_paths.append(path)
-                    
-                    self.get_logger().info(
-                        f"Tag ID {det['id']}: "
-                        f"angle={path['angle_deg']:.1f}°, "
-                        f"X={path['X']:.1f}cm, "
-                        f"Y={path['Y']:.1f}cm, "
-                        f"Z={path['Z']:.1f}cm"
-                    )
-
-                # Show graph
+                for tag_id in self.known_tags.keys():
+                    path = self.plan_path_to_tag_global(tag_id)
+                    tag_paths.append({
+                        'id': tag_id,
+                        'path': path
+                    })
+                
+                if len(tag_paths) == 0:
+                    self.get_logger().warn("No tags available")
+                    break
+                
+                # Show visualization
                 self.show_multi_path_graph(tag_paths)
-
+                
                 # Select target
                 if self.visit_all_tags:
-                    # Visit unvisited tags automatically
-                    unvisited = [p for p in tag_paths if p['id'] not in self.visited_tags]
+                    # Auto-visit unvisited tags
+                    unvisited = [p for p in tag_paths 
+                               if p['id'] not in self.visited_tags 
+                               and p['path'] is not None]
                     if len(unvisited) == 0:
-                        self.get_logger().info("All tags visited!")
+                        self.get_logger().info("✓ All tags visited!")
                         break
                     selected = unvisited[0]
-                    print(f"\n[AUTO] Visiting Tag ID {selected['id']}")
+                    print(f"\n[AUTO] Visiting Tag {selected['id']}")
                 else:
                     # Manual selection
                     selected = self.select_target_tag(tag_paths)
                     if selected is None:
-                        self.get_logger().info("User chose to land.")
+                        self.get_logger().info("User chose to land")
                         break
-
-                # Execute path to selected tag
-                self.execute_path_to_tag(selected)
-
+                
+                # Navigate to selected tag
+                success = self.execute_path_to_tag(selected)
+                
+                if not success:
+                    self.get_logger().warn("Navigation failed")
+                    retry = input("Retry? (y/n): ").strip().lower()
+                    if retry != 'y':
+                        break
+                
                 # Check if should continue
                 if not self.visit_all_tags:
                     cont = input("\nVisit another tag? (y/n): ").strip().lower()
                     if cont != 'y':
                         break
-
+            
             # Land
             self.get_logger().info("Landing...")
-            try:
-                self.tello.land()
-                time.sleep(3.0)
-            except Exception as e:
-                self.get_logger().error(f"Land failed: {e}")
-                return False
-
-            self.get_logger().info("Mission complete – landed.")
+            self.tello.land()
+            time.sleep(3.0)
+            self.get_logger().info("✓ Mission complete")
+            
             return True
-
+            
         except Exception as e:
             self.get_logger().error(f"Mission failed: {e}")
             self.get_logger().warn("Attempting emergency landing...")
             try:
                 if self.tello:
                     self.tello.land()
-            except Exception:
+                    time.sleep(3.0)
+            except:
                 pass
             return False
 
@@ -552,41 +577,34 @@ class TelloMultiArTagMissionNode(Node):
     # ------------------------------------------------
 
     def cleanup(self):
-        """Stop video, close windows, and end connection."""
-        self.get_logger().info("Cleaning up Tello connection...")
+        """Clean up resources."""
+        self.get_logger().info("Cleaning up...")
         if self.tello:
             try:
-                self.tello.streamoff()
-            except Exception:
-                pass
-            try:
                 self.tello.end()
-            except Exception:
+            except:
                 pass
-
-        if self.show_debug:
-            cv2.destroyAllWindows()
         plt.close('all')
-        self.get_logger().info("Cleanup done.")
+        self.get_logger().info("Cleanup done")
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = TelloMultiArTagMissionNode()
-
+    
     try:
         if node.connect_tello():
             time.sleep(1.0)
             node.execute_mission()
         else:
-            node.get_logger().error("Could not connect to Tello. Exiting.")
+            node.get_logger().error("Could not connect to Tello")
     except KeyboardInterrupt:
         try:
             if node.tello:
-                node.get_logger().info("KeyboardInterrupt! Attempting immediate land...")
+                node.get_logger().info("KeyboardInterrupt! Emergency landing...")
                 node.tello.land()
         except Exception as e:
-            node.get_logger().error(f"Immediate land on Ctrl+C failed: {e}")
+            node.get_logger().error(f"Emergency land failed: {e}")
     finally:
         node.cleanup()
         node.destroy_node()

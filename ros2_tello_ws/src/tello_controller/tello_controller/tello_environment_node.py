@@ -181,6 +181,10 @@ class TelloEnvironmentNode(Node):
         # After processing all visible tags, update the persistent map
         self.update_tag_map(current_observations)
 
+        # Publish ArUco markers for rtab-map
+        if len(current_observations) > 0:
+            self.publish_aruco_markers(current_observations)
+
         # Publish camera pose in map frame (avoids conflicts from multiple visible tags)
         if len(current_observations) > 0 and self.map_frame is not None:
             self._publish_camera_pose(current_observations)
@@ -247,7 +251,7 @@ class TelloEnvironmentNode(Node):
                 # Update existing tag
                 self.tag_map[marker_id]['observations'] += 1
                 self.tag_map[marker_id]['last_seen'] = self.get_clock().now()
-                # Could implement pose refinement here (e.g., averaging)
+                # TODO: Could implement pose refinement here (e.g., averaging)
 
     def _register_new_tag(self, new_id, new_obs, all_observations):
         """
@@ -399,6 +403,52 @@ class TelloEnvironmentNode(Node):
         transform.transform.rotation.w = float(quat_map_camera[3])
 
         self.tf_broadcaster.sendTransform(transform)
+
+    def publish_aruco_markers(self, observations):
+        """
+        Publish detected ArUco markers for rtab-map landmark integration.
+
+        Args:
+            observations: dict of {marker_id: {'tvec': ..., 'quat': ..., 'R': ...}}
+        """
+        from visualization_msgs.msg import Marker
+
+        marker_array = MarkerArray()
+
+        for marker_id, obs in observations.items():
+            marker = Marker()
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.header.frame_id = 'tello_camera'
+            marker.ns = 'aruco'
+            marker.id = int(marker_id)  # Convert numpy int to Python int
+            marker.type = Marker.CUBE
+            marker.action = Marker.ADD
+
+            # Position from tag detection
+            marker.pose.position.x = float(obs['tvec'][0])
+            marker.pose.position.y = float(obs['tvec'][1])
+            marker.pose.position.z = float(obs['tvec'][2])
+
+            # Orientation from quaternion
+            marker.pose.orientation.x = float(obs['quat'][0])
+            marker.pose.orientation.y = float(obs['quat'][1])
+            marker.pose.orientation.z = float(obs['quat'][2])
+            marker.pose.orientation.w = float(obs['quat'][3])
+
+            # Size matches physical tag (15cm)
+            marker.scale.x = 0.15
+            marker.scale.y = 0.15
+            marker.scale.z = 0.01
+
+            # Color - orange for visibility
+            marker.color.r = 1.0
+            marker.color.g = 0.5
+            marker.color.b = 0.0
+            marker.color.a = 0.8
+
+            marker_array.markers.append(marker)
+
+        self.aruco_pose_publisher.publish(marker_array)
 
     def publish_static_map(self):
         """

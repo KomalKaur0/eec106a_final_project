@@ -1,0 +1,9 @@
+# Generic Tello command service
+# Supports: takeoff, land, move_forward, move_back, move_left, move_right, move_up, move_down
+# rotate_clockwise, rotate_counter_clockwise
+
+string command          # Command name (e.g., "takeoff", "move_forward", "rotate_clockwise")
+int32 value             # Value for the command (distance in cm, angle in degrees, etc.)
+---
+bool success            # True if command succeeded
+string message          # Status or error message

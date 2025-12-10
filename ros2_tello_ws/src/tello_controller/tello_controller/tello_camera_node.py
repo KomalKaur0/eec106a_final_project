@@ -6,8 +6,10 @@ from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 from djitellopy import Tello
 from tello_interfaces.msg import TelloTelemetry
+from tello_interfaces.srv import TelloCommand
 import cv2
 import numpy as np
+import time
 
 
 class TelloCameraNode(Node):
@@ -31,6 +33,13 @@ class TelloCameraNode(Node):
             TelloTelemetry,
             '/tello/telemetry',
             10
+        )
+
+        # Create service for flight commands
+        self.command_service = self.create_service(
+            TelloCommand,
+            '/tello/command',
+            self.handle_command
         )
 
         # Create CV Bridge for converting OpenCV images to ROS messages
@@ -177,6 +186,111 @@ class TelloCameraNode(Node):
             msg.telemetry_valid = False
 
         return msg
+
+    def handle_command(self, request, response):
+        """
+        Service handler for Tello flight commands.
+
+        Executes commands on the shared Tello connection.
+        """
+        cmd = request.command
+        val = request.value
+
+        if not self.tello:
+            response.success = False
+            response.message = "Tello not connected"
+            return response
+
+        try:
+            # Execute command based on type
+            if cmd == 'takeoff':
+                self.get_logger().info('Command: takeoff')
+                self.tello.takeoff()
+                time.sleep(3)
+                response.success = True
+                response.message = "Takeoff complete"
+
+            elif cmd == 'land':
+                self.get_logger().info('Command: land')
+                self.tello.land()
+                time.sleep(3)
+                response.success = True
+                response.message = "Landing complete"
+
+            elif cmd == 'move_forward':
+                dist = max(20, min(val, 500))  # Clamp 20-500cm
+                self.get_logger().info(f'Command: move_forward {dist}cm')
+                self.tello.move_forward(dist)
+                time.sleep(2)
+                response.success = True
+                response.message = f"Moved forward {dist}cm"
+
+            elif cmd == 'move_back':
+                dist = max(20, min(val, 500))
+                self.get_logger().info(f'Command: move_back {dist}cm')
+                self.tello.move_back(dist)
+                time.sleep(2)
+                response.success = True
+                response.message = f"Moved back {dist}cm"
+
+            elif cmd == 'move_left':
+                dist = max(20, min(val, 500))
+                self.get_logger().info(f'Command: move_left {dist}cm')
+                self.tello.move_left(dist)
+                time.sleep(2)
+                response.success = True
+                response.message = f"Moved left {dist}cm"
+
+            elif cmd == 'move_right':
+                dist = max(20, min(val, 500))
+                self.get_logger().info(f'Command: move_right {dist}cm')
+                self.tello.move_right(dist)
+                time.sleep(2)
+                response.success = True
+                response.message = f"Moved right {dist}cm"
+
+            elif cmd == 'move_up':
+                dist = max(20, min(val, 500))
+                self.get_logger().info(f'Command: move_up {dist}cm')
+                self.tello.move_up(dist)
+                time.sleep(2)
+                response.success = True
+                response.message = f"Moved up {dist}cm"
+
+            elif cmd == 'move_down':
+                dist = max(20, min(val, 500))
+                self.get_logger().info(f'Command: move_down {dist}cm')
+                self.tello.move_down(dist)
+                time.sleep(2)
+                response.success = True
+                response.message = f"Moved down {dist}cm"
+
+            elif cmd == 'rotate_clockwise':
+                angle = max(1, min(val, 360))  # Clamp 1-360 degrees
+                self.get_logger().info(f'Command: rotate_clockwise {angle}°')
+                self.tello.rotate_clockwise(angle)
+                time.sleep(2)
+                response.success = True
+                response.message = f"Rotated clockwise {angle}°"
+
+            elif cmd == 'rotate_counter_clockwise':
+                angle = max(1, min(val, 360))
+                self.get_logger().info(f'Command: rotate_counter_clockwise {angle}°')
+                self.tello.rotate_counter_clockwise(angle)
+                time.sleep(2)
+                response.success = True
+                response.message = f"Rotated counter-clockwise {angle}°"
+
+            else:
+                response.success = False
+                response.message = f"Unknown command: {cmd}"
+
+        except Exception as e:
+            self.get_logger().error(f'Command {cmd} failed: {e}')
+            response.success = False
+            response.message = f"Command failed: {str(e)}"
+
+        return response
 
 
 def main(args=None):

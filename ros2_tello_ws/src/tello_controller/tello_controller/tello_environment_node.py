@@ -75,6 +75,9 @@ class TelloEnvironmentNode(Node):
         # Latest telemetry data for sensor fusion
         self.latest_telemetry = None
 
+        # Last known camera pose (maintained for continuous publishing)
+        self.last_camera_transform = None
+
         # Camera intrinsics (from constants file)
         self.camera_matrix = tc.CAMERA_MATRIX
         self.dist_coeffs = tc.DISTORTION_COEFFS
@@ -92,6 +95,18 @@ class TelloEnvironmentNode(Node):
 
         # Timer to publish static map transforms
         self.map_timer = self.create_timer(0.1, self.publish_static_map)  # 10 Hz
+
+        # Timer to periodically publish all known tags (for navigator to see)
+        self.tag_publish_timer = self.create_timer(
+            0.5,  # Publish at 2 Hz
+            self.publish_all_known_tags
+        )
+
+        # Timer to continuously publish camera_link transform (even when no tags visible)
+        self.camera_link_timer = self.create_timer(
+            0.1,  # Publish at 10 Hz
+            self.publish_camera_link
+        )
 
         self.get_logger().info("Tello Environment Node initialized")
 
@@ -387,7 +402,7 @@ class TelloEnvironmentNode(Node):
         rot = Rotation.from_matrix(R_map_camera)
         quat_map_camera = rot.as_quat()  # [x, y, z, w]
 
-        # Publish map -> camera_link transform
+        # Store camera pose for continuous publishing
         transform = TransformStamped()
         transform.header.stamp = self.get_clock().now().to_msg()
         transform.header.frame_id = "map"
@@ -402,7 +417,8 @@ class TelloEnvironmentNode(Node):
         transform.transform.rotation.z = float(quat_map_camera[2])
         transform.transform.rotation.w = float(quat_map_camera[3])
 
-        self.tf_broadcaster.sendTransform(transform)
+        # Store for continuous publishing by timer
+        self.last_camera_transform = transform
 
     def publish_aruco_markers(self, observations):
         """
@@ -449,6 +465,70 @@ class TelloEnvironmentNode(Node):
             marker_array.markers.append(marker)
 
         self.aruco_pose_publisher.publish(marker_array)
+
+    def publish_all_known_tags(self):
+        """
+        Periodically publish all known tags from the persistent map.
+
+        This ensures the navigator always has an up-to-date list of available tags,
+        even if they're not currently visible in the camera frame.
+        """
+        if len(self.tag_map) == 0:
+            return
+
+        from visualization_msgs.msg import Marker
+
+        marker_array = MarkerArray()
+
+        for marker_id, tag_data in self.tag_map.items():
+            marker = Marker()
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.header.frame_id = 'map'  # Use map frame since we have global positions
+            marker.ns = 'aruco_persistent'
+            marker.id = int(marker_id)
+            marker.type = Marker.CUBE
+            marker.action = Marker.ADD
+
+            # Position from persistent tag map
+            marker.pose.position.x = float(tag_data['position'][0])
+            marker.pose.position.y = float(tag_data['position'][1])
+            marker.pose.position.z = float(tag_data['position'][2])
+
+            # Orientation from persistent tag map
+            marker.pose.orientation.x = float(tag_data['orientation'][0])
+            marker.pose.orientation.y = float(tag_data['orientation'][1])
+            marker.pose.orientation.z = float(tag_data['orientation'][2])
+            marker.pose.orientation.w = float(tag_data['orientation'][3])
+
+            # Size matches physical tag (15cm)
+            marker.scale.x = 0.15
+            marker.scale.y = 0.15
+            marker.scale.z = 0.01
+
+            # Color - blue for persistent tags (different from orange real-time)
+            marker.color.r = 0.0
+            marker.color.g = 0.5
+            marker.color.b = 1.0
+            marker.color.a = 0.6
+
+            marker_array.markers.append(marker)
+
+        self.aruco_pose_publisher.publish(marker_array)
+
+    def publish_camera_link(self):
+        """
+        Continuously publish the last known camera_link transform.
+        This ensures camera_link is always available in TF tree,
+        even when no ArUco tags are currently visible.
+        """
+        if self.last_camera_transform is None:
+            return
+
+        # Update timestamp to current time
+        self.last_camera_transform.header.stamp = self.get_clock().now().to_msg()
+
+        # Broadcast the transform
+        self.tf_broadcaster.sendTransform(self.last_camera_transform)
 
     def publish_static_map(self):
         """

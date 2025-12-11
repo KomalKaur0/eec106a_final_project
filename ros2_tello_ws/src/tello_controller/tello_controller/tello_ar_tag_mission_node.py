@@ -35,8 +35,8 @@ class TelloArTagMissionNode(Node):
 
         # ---------------- Parameters ----------------
         self.declare_parameter("hover_height", 70)        # kept but no longer used for extra up
-        self.declare_parameter("marker_id", 0)            # ArUco ID
-        self.declare_parameter("tag_size_cm", 15.0)       # your tag = 150 mm
+        self.declare_parameter("marker_id", 1)            # ArUco ID
+        self.declare_parameter("tag_size_cm", 17.7)       # your tag = 177 mm
         self.declare_parameter("search_timeout", 40.0)    # seconds
         self.declare_parameter("show_debug_window", True)
 
@@ -67,7 +67,7 @@ class TelloArTagMissionNode(Node):
         self.connected = False
 
         # ArUco setup
-        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_1000)
         self.aruco_params = cv2.aruco.DetectorParameters()
 
     # ------------------------------------------------

@@ -354,8 +354,8 @@ class TelloArucoNavigatorNode(Node):
             while angle_relative_to_camera_deg < -180:
                 angle_relative_to_camera_deg += 360
 
-            # Apply the same sign fix as in navigate_to_tag
-            angle_relative_to_camera_deg = -angle_relative_to_camera_deg
+            # Apply same coordinate frame correction
+            # angle_relative_to_camera_deg = -angle_relative_to_camera_deg
 
             self.get_logger().info(
                 f'Calculated target (tag {target_tag_id}) from visible tag {visible_tag_id}: '
@@ -392,13 +392,14 @@ class TelloArucoNavigatorNode(Node):
         self.get_logger().warn('No tags found after retries')
         return self.available_tags.copy()
 
-    def send_command(self, command: str, value: int = 0) -> bool:
+    def send_command(self, command: str, value: int = 0, stabilize_after: float = 0.0) -> bool:
         """
         Send a command to the Tello via the service.
 
         Args:
             command: Command name (e.g., 'takeoff', 'move_forward')
             value: Optional value (distance in cm, angle in degrees)
+            stabilize_after: Seconds to wait after command for drone to stabilize (default: 0.0)
 
         Returns:
             True if command succeeded, False otherwise
@@ -418,6 +419,16 @@ class TelloArucoNavigatorNode(Node):
             response = future.result()
             if response.success:
                 self.get_logger().info(f'Command {command} succeeded: {response.message}')
+
+                # Add stabilization delay if requested
+                if stabilize_after > 0:
+                    import time
+                    self.get_logger().info(f'Stabilizing for {stabilize_after:.1f}s...')
+                    start = time.time()
+                    while time.time() - start < stabilize_after:
+                        rclpy.spin_once(self, timeout_sec=0.1)
+                        time.sleep(0.1)
+
                 return True
             else:
                 self.get_logger().error(f'Command {command} failed: {response.message}')
@@ -780,14 +791,12 @@ class TelloArucoNavigatorNode(Node):
             while rotation_needed_deg < -180:
                 rotation_needed_deg += 360
 
-            # EXPERIMENTAL FIX: Negate rotation to test coordinate frame sign
-            # If the drone was rotating in the opposite direction, this should fix it
-            rotation_needed_deg = -rotation_needed_deg
-            self.get_logger().warn(f'APPLIED SIGN FIX: Negated rotation direction!')
+            # Coordinate frame correction: Negate rotation for correct direction
+            # rotation_needed_deg = -rotation_needed_deg
 
             self.get_logger().info(
                 f'Initial bearing: drone_yaw={drone_yaw_deg:.1f}°, '
-                f'target_angle={target_angle_deg:.1f}°, rotation={rotation_needed_deg:.1f}° (AFTER SIGN FIX)'
+                f'target_angle={target_angle_deg:.1f}°, rotation={rotation_needed_deg:.1f}° (negated)'
             )
 
             # Step 2: Rotate to face tag (coarse alignment)
@@ -964,6 +973,19 @@ class TelloArucoNavigatorNode(Node):
 
                 self.in_flight = True
                 print("✓ Airborne\n")
+
+                # CRITICAL: Wait for IMU to stabilize after takeoff
+                # The Tello's IMU needs 3-4 seconds to stabilize before accepting movement commands
+                # Without this delay, we get "error No valid imu" responses
+                print("Waiting for IMU to stabilize...")
+                import time
+                stabilization_time = 3.5  # seconds
+                start_wait = time.time()
+                while time.time() - start_wait < stabilization_time:
+                    # Keep ROS spinning while we wait
+                    rclpy.spin_once(self, timeout_sec=0.1)
+                    time.sleep(0.1)
+                print("✓ IMU stabilized\n")
 
                 # Fly up and rotate until we see a tag (to localize position)
                 print("Flying up 30cm for better view...")

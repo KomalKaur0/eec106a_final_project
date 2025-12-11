@@ -38,8 +38,8 @@ ARUCO_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 # ArUco detector parameters (use defaults)
 ARUCO_PARAMS = cv2.aruco.DetectorParameters()
 
-# Marker physical size in meters <- our printed markers are 15 cm
-MARKER_SIZE_M = 0.15  # 15 cm
+# Marker physical size in meters <- our printed markers are 17.7 cm
+MARKER_SIZE_M = 0.177  # 17.7 cm
 
 # ==============================================================================
 # Camera Frame Settings

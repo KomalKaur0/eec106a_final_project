@@ -20,6 +20,7 @@ map
  └── base_link
 
       └── camera_link
+
 ### coordinate convention
 map (world frame):
 
@@ -44,6 +45,3 @@ X: Right (in image)
 Y: Down (in image)
 
 Z: Forward (into scene)
-
-## Handoff
-...

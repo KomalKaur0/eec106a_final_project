@@ -17,10 +17,15 @@ Workflow:
 
 import rclpy
 from rclpy.node import Node
-from tf2_ros import Buffer, TransformListener
+from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
 from tello_interfaces.srv import TelloCommand
+from visualization_msgs.msg import MarkerArray
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+import cv2
+import numpy as np
 import math
-import yaml
+from tello_controller import tello_constants as tc
 
 
 class TelloArucoNavigatorNode(Node):
@@ -43,12 +48,41 @@ class TelloArucoNavigatorNode(Node):
         # Flight state tracking
         self.in_flight = False
 
+        # Cached set of available tags (updated via MarkerArray subscription)
+        self.available_tags = set()
+
         # TF for getting tag positions
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
+        # Camera-based detection (for fresh observations during navigation)
+        self.bridge = CvBridge()
+        self.latest_camera_frame = None
+        self.camera_matrix = tc.CAMERA_MATRIX
+        self.dist_coeffs = tc.DISTORTION_COEFFS
+        self.aruco_dict = tc.ARUCO_DICT
+        self.aruco_params = tc.ARUCO_PARAMS
+        self.marker_size_m = tc.MARKER_SIZE_M
+        self.focal_length_px = tc.FOCAL_LENGTH_PX
+
         # Service client for flight commands
         self.command_client = self.create_client(TelloCommand, '/tello/command')
+
+        # Subscribe to published ArUco markers from environment node
+        self.aruco_sub = self.create_subscription(
+            MarkerArray,
+            '/world/aruco_poses',
+            self.aruco_callback,
+            10
+        )
+
+        # Subscribe to camera for fresh detections during navigation
+        self.camera_sub = self.create_subscription(
+            Image,
+            '/tello/camera/image_raw',
+            self.camera_callback,
+            10
+        )
 
         # Wait for service to be available
         self.get_logger().info('Waiting for /tello/command service...')
@@ -59,49 +93,304 @@ class TelloArucoNavigatorNode(Node):
         self.get_logger().info(f'Min battery: {self.min_battery}%')
         self.get_logger().info(f'Approach distance: {self.approach_distance}cm')
 
-    def get_available_tags(self):
+    def aruco_callback(self, msg: MarkerArray):
         """
-        Query TF tree for all available ArUco tags.
+        Update the set of available tags based on published markers.
+        Environment node publishes all known tags at 2 Hz.
+        """
+        if len(msg.markers) > 0:
+            new_tags = {marker.id for marker in msg.markers}
+            if new_tags != self.available_tags:
+                self.available_tags = new_tags
+                self.get_logger().debug(f'Available tags updated: {sorted(self.available_tags)}')
+
+    def camera_callback(self, msg: Image):
+        """Cache latest camera frame for navigation."""
+        try:
+            self.latest_camera_frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
+        except Exception as e:
+            self.get_logger().warn(f'Failed to convert camera image: {e}')
+
+    def detect_any_tag_in_camera(self, timeout_sec: float = 5.0):
+        """
+        Detect ANY ArUco tag in camera frame (not target-specific).
+        Returns the first/closest tag found.
+
+        Args:
+            timeout_sec: Maximum time to wait for detection
 
         Returns:
-            Set of tag IDs that are available in the TF tree
+            (tag_id, distance_cm, angle_deg, lateral_offset_cm) or None if not detected
         """
-        available_tags = set()
+        import time
+        start_time = time.time()
 
-        # Get all frames from TF tree
+        while time.time() - start_time < timeout_sec:
+            # Spin to get fresh camera frame
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+            if self.latest_camera_frame is None:
+                continue
+
+            frame = self.latest_camera_frame.copy()
+            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+
+            # Detect ArUco markers
+            corners, ids, _ = cv2.aruco.detectMarkers(
+                gray,
+                self.aruco_dict,
+                parameters=self.aruco_params
+            )
+
+            if ids is None or len(ids) == 0:
+                continue
+
+            ids = ids.flatten()
+
+            # Return the FIRST tag found (could improve to return closest)
+            marker_id = int(ids[0])
+            marker_corners = corners[0][0]  # Shape (4, 2)
+
+            # Calculate center pixel position
+            center_x = np.mean(marker_corners[:, 0])
+            center_y = np.mean(marker_corners[:, 1])
+
+            # Calculate tag width in pixels
+            tag_width_px = np.linalg.norm(marker_corners[0] - marker_corners[1])
+
+            # Image center
+            h, w = frame.shape[:2]
+            img_center_x = w / 2.0
+
+            # Calculate horizontal offset from image center
+            dx_px = center_x - img_center_x
+
+            # Pinhole camera model (from working mission node)
+            # Distance: Z = (real_size * focal_length) / pixel_size
+            tag_size_cm = self.marker_size_m * 100  # Convert to cm
+            distance_cm = (tag_size_cm * self.focal_length_px) / tag_width_px
+
+            # Angle: theta = atan2(dx_px, focal_length)
+            angle_rad = math.atan2(dx_px, self.focal_length_px)
+            angle_deg = math.degrees(angle_rad)
+
+            # Lateral offset: X = Z * sin(theta)
+            lateral_offset_cm = distance_cm * math.sin(angle_rad)
+
+            self.get_logger().info(
+                f'Detected ANY tag {marker_id}: '
+                f'distance={distance_cm:.1f}cm, angle={angle_deg:.1f}°, '
+                f'lateral_offset={lateral_offset_cm:.1f}cm'
+            )
+
+            return marker_id, distance_cm, angle_deg, lateral_offset_cm
+
+        self.get_logger().warn(f'No tags detected after {timeout_sec}s')
+        return None
+
+    def detect_tag_in_camera(self, target_tag_id: int, timeout_sec: float = 5.0):
+        """
+        Detect target tag in camera frame using direct ArUco detection.
+        Spins until tag is detected or timeout.
+
+        Args:
+            target_tag_id: ID of tag to detect
+            timeout_sec: Maximum time to wait for detection
+
+        Returns:
+            (distance_cm, angle_deg, lateral_offset_cm) or None if not detected
+        """
+        import time
+        start_time = time.time()
+
+        while time.time() - start_time < timeout_sec:
+            # Spin to get fresh camera frame
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+            if self.latest_camera_frame is None:
+                continue
+
+            frame = self.latest_camera_frame.copy()
+            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+
+            # Detect ArUco markers
+            corners, ids, _ = cv2.aruco.detectMarkers(
+                gray,
+                self.aruco_dict,
+                parameters=self.aruco_params
+            )
+
+            if ids is None or len(ids) == 0:
+                continue
+
+            ids = ids.flatten()
+
+            # Find target tag
+            target_idx = None
+            for i, marker_id in enumerate(ids):
+                if marker_id == target_tag_id:
+                    target_idx = i
+                    break
+
+            if target_idx is None:
+                continue
+
+            # Get marker corners
+            marker_corners = corners[target_idx][0]  # Shape (4, 2)
+
+            # Calculate center pixel position
+            center_x = np.mean(marker_corners[:, 0])
+            center_y = np.mean(marker_corners[:, 1])
+
+            # Calculate tag width in pixels
+            tag_width_px = np.linalg.norm(marker_corners[0] - marker_corners[1])
+
+            # Image center
+            h, w = frame.shape[:2]
+            img_center_x = w / 2.0
+
+            # Calculate horizontal offset from image center
+            dx_px = center_x - img_center_x
+
+            # Pinhole camera model (from working mission node)
+            # Distance: Z = (real_size * focal_length) / pixel_size
+            tag_size_cm = self.marker_size_m * 100  # Convert to cm
+            distance_cm = (tag_size_cm * self.focal_length_px) / tag_width_px
+
+            # Angle: theta = atan2(dx_px, focal_length)
+            angle_rad = math.atan2(dx_px, self.focal_length_px)
+            angle_deg = math.degrees(angle_rad)
+
+            # Lateral offset: X = Z * sin(theta)
+            lateral_offset_cm = distance_cm * math.sin(angle_rad)
+
+            self.get_logger().info(
+                f'Detected tag {target_tag_id}: '
+                f'distance={distance_cm:.1f}cm, angle={angle_deg:.1f}°, '
+                f'lateral_offset={lateral_offset_cm:.1f}cm'
+            )
+
+            return distance_cm, angle_deg, lateral_offset_cm
+
+        self.get_logger().warn(f'Tag {target_tag_id} not detected after {timeout_sec}s')
+        return None
+
+    def calculate_target_angle_and_distance_from_visible_tag(
+        self,
+        target_tag_id: int,
+        visible_tag_id: int,
+        visible_tag_angle_deg: float
+    ):
+        """
+        Calculate angle and distance to target tag using a visible tag + TF.
+
+        This allows navigation to a tag that's NOT in the camera view, by using
+        a tag that IS visible plus the known map.
+
+        Args:
+            target_tag_id: ID of tag we want to navigate to
+            visible_tag_id: ID of tag currently visible in camera
+            visible_tag_angle_deg: Angle to visible tag from camera center
+
+        Returns:
+            (angle_to_target_deg, distance_to_target_cm) or None if TF lookup fails
+        """
         try:
-            all_frames = self.tf_buffer.all_frames_as_yaml()
+            # Get both tags' positions in map frame
+            visible_tag_tf = self.tf_buffer.lookup_transform(
+                'map',
+                f'tag_{visible_tag_id}',
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.5)
+            )
 
-            # Parse for tag frames (format: "tag_N")
-            if all_frames:
-                frames_dict = yaml.safe_load(all_frames)
+            target_tag_tf = self.tf_buffer.lookup_transform(
+                'map',
+                f'tag_{target_tag_id}',
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.5)
+            )
 
-                if frames_dict:
-                    all_frame_names = list(frames_dict.keys())
-                    self.get_logger().debug(f'All frames in TF tree: {all_frame_names}')
+            # Get camera position in map frame
+            camera_tf = self.tf_buffer.lookup_transform(
+                'map',
+                'camera_link',
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.5)
+            )
 
-                    for frame_name in all_frame_names:
-                        if frame_name.startswith('tag_'):
-                            try:
-                                # Extract tag ID from frame name (e.g., "tag_5" -> 5)
-                                tag_id_str = frame_name[4:]  # Remove "tag_" prefix
-                                tag_id = int(tag_id_str)
-                                available_tags.add(tag_id)
-                                self.get_logger().debug(f'Found tag {tag_id} from frame "{frame_name}"')
-                            except (ValueError, IndexError) as e:
-                                self.get_logger().warn(f'Failed to parse tag ID from frame "{frame_name}": {e}')
-                else:
-                    self.get_logger().warn('TF tree YAML parsed to None')
-            else:
-                self.get_logger().warn('TF tree YAML is empty')
+            # Extract positions
+            cam_x = camera_tf.transform.translation.x
+            cam_y = camera_tf.transform.translation.y
+
+            target_x = target_tag_tf.transform.translation.x
+            target_y = target_tag_tf.transform.translation.y
+
+            # Calculate vector from camera to target in map frame
+            dx_map = target_x - cam_x
+            dy_map = target_y - cam_y
+
+            # Calculate distance
+            distance_m = math.sqrt(dx_map**2 + dy_map**2)
+            distance_cm = distance_m * 100
+
+            # Calculate angle in map frame
+            target_angle_map = math.atan2(dy_map, dx_map)
+
+            # Get camera's current yaw in map frame
+            q = camera_tf.transform.rotation
+            siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+            cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+            camera_yaw = math.atan2(siny_cosp, cosy_cosp)
+
+            # Calculate angle relative to camera (camera-frame angle)
+            # This is the angle the drone needs to rotate
+            angle_relative_to_camera_rad = target_angle_map - camera_yaw
+            angle_relative_to_camera_deg = math.degrees(angle_relative_to_camera_rad)
+
+            # Normalize to [-180, 180]
+            while angle_relative_to_camera_deg > 180:
+                angle_relative_to_camera_deg -= 360
+            while angle_relative_to_camera_deg < -180:
+                angle_relative_to_camera_deg += 360
+
+            # Apply the same sign fix as in navigate_to_tag
+            angle_relative_to_camera_deg = -angle_relative_to_camera_deg
+
+            self.get_logger().info(
+                f'Calculated target (tag {target_tag_id}) from visible tag {visible_tag_id}: '
+                f'angle={angle_relative_to_camera_deg:.1f}°, distance={distance_cm:.1f}cm'
+            )
+
+            return angle_relative_to_camera_deg, distance_cm
 
         except Exception as e:
-            self.get_logger().error(f'Failed to query TF tree: {e}')
-            import traceback
-            self.get_logger().error(traceback.format_exc())
+            self.get_logger().error(f'Failed to calculate target from visible tag: {e}')
+            return None
 
-        self.get_logger().info(f'Total tags found: {len(available_tags)} - {sorted(list(available_tags))}')
-        return available_tags
+    def get_available_tags(self):
+        """
+        Get available ArUco tags from cached subscription data with retry logic.
+
+        Returns:
+            Set of tag IDs that are available
+        """
+        import time
+
+        # Try multiple times to ensure MarkerArray message arrives
+        for attempt in range(3):
+            rclpy.spin_once(self, timeout_sec=0.5)
+
+            if len(self.available_tags) > 0:
+                self.get_logger().info(f'Found {len(self.available_tags)} tags: {sorted(list(self.available_tags))}')
+                return self.available_tags.copy()
+
+            if attempt < 2:  # Don't sleep on the last attempt
+                time.sleep(0.5)
+
+        # Return empty set if no tags found after retries
+        self.get_logger().warn('No tags found after retries')
+        return self.available_tags.copy()
 
     def send_command(self, command: str, value: int = 0) -> bool:
         """
@@ -175,49 +464,6 @@ class TelloArucoNavigatorNode(Node):
 
         return (x, y, z)
 
-    def is_tag_horizontal(self, tag_id: int, threshold_deg: float = 30.0) -> bool:
-        """
-        Check if a tag is horizontal (lying flat, e.g., on the ground).
-
-        A tag is considered horizontal if its Z-axis (normal vector) points
-        roughly upward in the world frame.
-
-        Args:
-            tag_id: The tag ID to check
-            threshold_deg: Maximum angle from vertical (default 30°)
-
-        Returns:
-            True if tag is horizontal, False otherwise
-        """
-        transform = self.get_tag_transform(tag_id)
-        if transform is None:
-            return False
-
-        # Get quaternion
-        q = transform.transform.rotation
-        qx, qy = q.x, q.y
-
-        # Convert quaternion to rotation matrix (we only need the Z component)
-        # Z-axis of tag frame in world coordinates (3rd row, 3rd column of rotation matrix)
-        tag_z_z = 1.0 - 2.0 * (qx * qx + qy * qy)
-
-        # World Z-axis is (0, 0, 1)
-        # Dot product tells us alignment: close to 1 = pointing up, close to -1 = pointing down
-        dot_product = tag_z_z  # Since world Z is (0,0,1)
-
-        # Calculate angle from vertical
-        angle_rad = math.acos(max(-1.0, min(1.0, abs(dot_product))))
-        angle_deg = math.degrees(angle_rad)
-
-        is_horizontal = angle_deg < threshold_deg
-
-        self.get_logger().info(
-            f'Tag {tag_id} orientation: {angle_deg:.1f}° from vertical '
-            f'{"HORIZONTAL" if is_horizontal else "VERTICAL"}'
-        )
-
-        return is_horizontal
-
     def get_camera_position(self):
         """
         Look up current camera position in map frame.
@@ -262,6 +508,58 @@ class TelloArucoNavigatorNode(Node):
         except Exception:
             return False
 
+    def ensure_localized(self, max_rotation: int = 360) -> bool:
+        """
+        Ensure drone is localized. If not, rotate until ANY tag is visible.
+
+        Args:
+            max_rotation: Maximum degrees to rotate while searching
+
+        Returns:
+            True if localized, False if failed after full rotation
+        """
+        if self.is_localized():
+            self.get_logger().info('Already localized')
+            return True
+
+        print("\n⚠️  Not localized - rotating to find ANY tag...")
+        self.get_logger().warn('Lost localization, searching for tags...')
+
+        import time
+        total_rotation = 0
+        rotation_increment = 30
+
+        while total_rotation < max_rotation:
+            # Try to detect ANY tag in camera
+            detection = self.detect_any_tag_in_camera(timeout_sec=2.0)
+
+            if detection is not None:
+                tag_id, _, _, _ = detection
+                print(f"✓ Found tag {tag_id}")
+                self.get_logger().info(f'Detected tag {tag_id}, waiting for TF to update...')
+
+                # Wait for TF to update with this observation
+                time.sleep(0.5)
+                for _ in range(3):
+                    rclpy.spin_once(self, timeout_sec=0.2)
+
+                # Check if we're now localized
+                if self.is_localized():
+                    print("✓ Localized!")
+                    self.get_logger().info('Successfully re-localized')
+                    return True
+
+            # Rotate to search for tags
+            print(f"Rotating to search... ({total_rotation}° / {max_rotation}°)")
+            if not self.send_command('rotate_clockwise', rotation_increment):
+                return False
+
+            total_rotation += rotation_increment
+            time.sleep(0.5)
+
+        self.get_logger().error('Failed to localize after full rotation')
+        return False
+
     def search_and_localize(self, stay_airborne: bool = True) -> bool:
         """
         Search routine: fly up and spin to find known tags.
@@ -276,15 +574,15 @@ class TelloArucoNavigatorNode(Node):
         try:
             if not stay_airborne:
                 # Step 1: Takeoff
-                print("\n📍 Taking off...")
+                print("\nTaking off...")
                 self.get_logger().info('Taking off for search...')
                 if not self.send_command('takeoff'):
                     return False
                 self.in_flight = True
-                print("✓ Takeoff complete")
+                print("Takeoff complete")
 
                 # Step 2: Fly up for better view
-                print("\n📍 Flying up 50cm for better visibility...")
+                print("\nFlying up 50cm for better visibility...")
                 self.get_logger().info('Moving up for search...')
                 if not self.send_command('move_up', 50):
                     self.emergency_land()
@@ -292,7 +590,7 @@ class TelloArucoNavigatorNode(Node):
                 print("✓ Altitude gained")
 
             # Step 3: Rotate and search for tags
-            print("\n📍 Searching for ArUco tags (will rotate 360°)...")
+            print("\nSearching for ArUco tags (will rotate 360°)...")
             self.get_logger().info('Starting rotation search...')
 
             total_rotation = 0
@@ -300,32 +598,50 @@ class TelloArucoNavigatorNode(Node):
             max_rotation = 360
 
             while total_rotation < max_rotation:
-                # Spin multiple times to ensure TF buffer updates
-                for _ in range(3):
+                # Give time for camera to process new view
+                import time
+                time.sleep(1.0)  # Wait for camera processing
+
+                # Spin to get fresh camera frames
+                for _ in range(5):
                     rclpy.spin_once(self, timeout_sec=0.2)
 
-                # Check if we're localized
-                if self.is_localized():
-                    available_tags = self.get_available_tags()
-                    if len(available_tags) > 0:
-                        print(f"\n✓ Localized! Found {len(available_tags)} tag(s): {sorted(available_tags)}")
-                        self.get_logger().info(f'Localized successfully with tags: {sorted(available_tags)}')
-                        return True
+                # Check if we can see any tags in camera (more reliable than TF check)
+                detection_found = False
+                if self.latest_camera_frame is not None:
+                    gray = cv2.cvtColor(self.latest_camera_frame, cv2.COLOR_RGB2GRAY)
+                    corners, ids, _ = cv2.aruco.detectMarkers(
+                        gray, self.aruco_dict, parameters=self.aruco_params
+                    )
+                    if ids is not None and len(ids) > 0:
+                        detection_found = True
+                        detected_ids = ids.flatten().tolist()
+                        self.get_logger().info(f'Camera detected tags: {detected_ids}')
+
+                # If we detected tags, wait for TF to update and check localization
+                if detection_found:
+                    time.sleep(0.5)  # Brief delay for TF to update
+                    for _ in range(3):
+                        rclpy.spin_once(self, timeout_sec=0.2)
+
+                    # Now check if we're localized via TF
+                    if self.is_localized():
+                        available_tags = self.get_available_tags()
+                        if len(available_tags) > 0:
+                            print(f"\nLocalized! Found {len(available_tags)} tag(s): {sorted(available_tags)}")
+                            self.get_logger().info(f'Localized successfully with tags: {sorted(available_tags)}')
+                            return True
 
                 # Rotate a bit more
-                print(f"  Rotating... ({total_rotation}° / {max_rotation}°)")
+                print(f"Rotating... ({total_rotation}° / {max_rotation}°)")
                 if not self.send_command('rotate_clockwise', rotation_increment):
                     self.emergency_land()
                     return False
 
                 total_rotation += rotation_increment
 
-                # Give time for camera to process new view
-                import time
-                time.sleep(1.0)  # Longer wait for camera processing
-
             # Completed full rotation without localizing
-            print("\n❌ Search complete but no known tags found")
+            print("\nSearch complete but no known tags found")
             self.get_logger().warn('Completed 360° search without finding known tags')
 
             if not stay_airborne:
@@ -402,233 +718,190 @@ class TelloArucoNavigatorNode(Node):
 
     def navigate_to_tag(self, tag_id: int) -> bool:
         """
-        Navigate the drone to the specified tag.
-
-        Strategy for VERTICAL tags (on walls):
-        1. Rotate to face tag
-        2. Move forward (stopping before tag)
-        3. Land
-
-        Strategy for HORIZONTAL tags (on ground):
-        1. Move above the tag (XY positioning)
-        2. Descend and land directly on tag
+        Navigate to tag using hybrid approach:
+        1. Use TF to verify tag exists in map and calculate initial bearing
+        2. Rotate to face tag (using TF for coarse alignment)
+        3. Use fresh camera detection for final approach (fixes stale data bug)
 
         Returns:
             True if successful, False otherwise
         """
-        # Check if tag is horizontal
-        is_horizontal = self.is_tag_horizontal(tag_id)
-
-        # Get transform from camera to tag (relative position)
         try:
-            transform = self.tf_buffer.lookup_transform(
-                'camera_link',  # From camera
-                f'tag_{tag_id}',  # To tag
+            # Step 1: Get initial bearing from TF (for rotation planning)
+            camera_transform = self.tf_buffer.lookup_transform(
+                'map',
+                'camera_link',
                 rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=1.0)
             )
 
-            # Extract relative position
-            dx = transform.transform.translation.x
-            dy = transform.transform.translation.y
-            dz = transform.transform.translation.z
-
-            self.get_logger().info(
-                f'Tag {tag_id} relative to camera: '
-                f'dx={dx:.2f}m, dy={dy:.2f}m, dz={dz:.2f}m'
+            tag_transform = self.tf_buffer.lookup_transform(
+                'map',
+                f'tag_{tag_id}',
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=1.0)
             )
 
-        except Exception as e:
-            self.get_logger().error(f'Cannot get transform from camera to tag {tag_id}: {e}')
-            return False
+            # Calculate initial rotation needed (map frame)
+            drone_x = camera_transform.transform.translation.x
+            drone_y = camera_transform.transform.translation.y
 
-        if is_horizontal:
-            # Horizontal tag: land on top
-            return self._navigate_to_horizontal_tag(dx, dy, dz)
-        else:
-            # Vertical tag: approach from front
-            return self._navigate_to_vertical_tag(dx, dy, dz)
+            q = camera_transform.transform.rotation
+            siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+            cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+            drone_yaw_rad = math.atan2(siny_cosp, cosy_cosp)
+            drone_yaw_deg = math.degrees(drone_yaw_rad)
 
-    def _navigate_to_vertical_tag(self, dx: float, dy: float, dz: float) -> bool:
-        """
-        Navigate to a vertical tag (on a wall).
-        Adjusts height, then approaches from the front.
+            tag_x = tag_transform.transform.translation.x
+            tag_y = tag_transform.transform.translation.y
 
-        Args:
-            dx, dy, dz: Relative position of tag from camera (meters)
-        """
-        # Calculate horizontal distance and angle
-        horizontal_dist = math.sqrt(dx**2 + dy**2)
-        angle_to_tag = math.atan2(dx, dy)  # Note: atan2(x, y) because drone forward is +Y
-        angle_deg = math.degrees(angle_to_tag)
+            dx_map = tag_x - drone_x
+            dy_map = tag_y - drone_y
 
-        # Convert to cm for Tello commands
-        horizontal_dist_cm = horizontal_dist * 100
-        vertical_dist_cm = dz * 100  # Positive = tag is above, negative = tag is below
+            target_angle_rad = math.atan2(dy_map, dx_map)
+            target_angle_deg = math.degrees(target_angle_rad)
 
-        self.get_logger().info(
-            f'Vertical tag navigation: height_adjust={vertical_dist_cm:.1f}cm, '
-            f'rotate={angle_deg:.1f}°, forward={horizontal_dist_cm:.1f}cm'
-        )
+            # DEBUG: Log all coordinate frame data
+            self.get_logger().info('='*60)
+            self.get_logger().info('COORDINATE FRAME DEBUG')
+            self.get_logger().info(f'Drone position (map frame): ({drone_x:.3f}, {drone_y:.3f})')
+            self.get_logger().info(f'Target tag position (map frame): ({tag_x:.3f}, {tag_y:.3f})')
+            self.get_logger().info(f'Vector to target: dx={dx_map:.3f}, dy={dy_map:.3f}')
+            self.get_logger().info(f'Drone quaternion: x={q.x:.3f}, y={q.y:.3f}, z={q.z:.3f}, w={q.w:.3f}')
+            self.get_logger().info(f'Drone yaw (from quat): {drone_yaw_deg:.1f}°')
+            self.get_logger().info(f'Target angle (atan2): {target_angle_deg:.1f}°')
+            self.get_logger().info('='*60)
 
-        # Confirm with user
-        print(f"\n📋 Navigation Plan (VERTICAL TAG):")
-        if abs(vertical_dist_cm) > 20:
-            if vertical_dist_cm > 0:
-                print(f"   Move up: {abs(vertical_dist_cm):.1f}cm (to match tag height)")
-            else:
-                print(f"   Move down: {abs(vertical_dist_cm):.1f}cm (to match tag height)")
-        print(f"   Rotate: {angle_deg:.1f}°")
-        print(f"   Move forward: {horizontal_dist_cm:.1f}cm")
-        print(f"   (Will stop {self.approach_distance}cm before tag)")
+            rotation_needed_deg = target_angle_deg - drone_yaw_deg
 
-        response = input("\nExecute? (y/n): ").strip().lower()
-        if response != 'y':
-            self.get_logger().info('Navigation cancelled by user')
-            return False
+            # Normalize to [-180, 180]
+            while rotation_needed_deg > 180:
+                rotation_needed_deg -= 360
+            while rotation_needed_deg < -180:
+                rotation_needed_deg += 360
 
-        try:
-            # Step 1: Adjust height to match tag
-            if abs(vertical_dist_cm) > 20:  # Only adjust if significant difference
-                if vertical_dist_cm > 0:
-                    # Tag is above, fly up
-                    move_up_cm = min(abs(vertical_dist_cm), 500)  # Safety limit
-                    print(f"\n📍 Adjusting altitude (up {move_up_cm:.0f}cm)...")
-                    if not self.send_command('move_up', int(move_up_cm)):
-                        self.emergency_land()
-                        return False
+            # EXPERIMENTAL FIX: Negate rotation to test coordinate frame sign
+            # If the drone was rotating in the opposite direction, this should fix it
+            rotation_needed_deg = -rotation_needed_deg
+            self.get_logger().warn(f'APPLIED SIGN FIX: Negated rotation direction!')
+
+            self.get_logger().info(
+                f'Initial bearing: drone_yaw={drone_yaw_deg:.1f}°, '
+                f'target_angle={target_angle_deg:.1f}°, rotation={rotation_needed_deg:.1f}° (AFTER SIGN FIX)'
+            )
+
+            # Step 2: Rotate to face tag (coarse alignment)
+            if abs(rotation_needed_deg) > 5:
+                print(f"\n📍 Rotating {rotation_needed_deg:.1f}° to face tag...")
+
+                if rotation_needed_deg > 0:
+                    cmd = 'rotate_clockwise'
                 else:
-                    # Tag is below, fly down
-                    move_down_cm = min(abs(vertical_dist_cm), 500)  # Safety limit
-                    print(f"\n📍 Adjusting altitude (down {move_down_cm:.0f}cm)...")
-                    if not self.send_command('move_down', int(move_down_cm)):
-                        self.emergency_land()
-                        return False
-                print("✓ Height adjusted")
+                    cmd = 'rotate_counter_clockwise'
 
-            # Step 2: Rotate to face tag
-            if abs(angle_deg) > 5:  # Only rotate if angle is significant
-                print(f"\n📍 Rotating to face tag ({abs(angle_deg):.1f}°)...")
-                if angle_deg > 0:
-                    if not self.send_command('rotate_clockwise', int(abs(angle_deg))):
-                        self.emergency_land()
-                        return False
-                else:
-                    if not self.send_command('rotate_counter_clockwise', int(abs(angle_deg))):
-                        self.emergency_land()
-                        return False
-                print("✓ Rotation complete")
-
-            # Step 3: Move forward toward tag (leaving approach distance buffer)
-            forward_dist = max(0, horizontal_dist_cm - self.approach_distance)
-            forward_dist = min(forward_dist, self.max_forward)  # Safety limit
-
-            if forward_dist > 20:  # Tello minimum is 20cm
-                print(f"\n📍 Moving forward ({forward_dist:.0f}cm)...")
-                if not self.send_command('move_forward', int(forward_dist)):
+                if not self.send_command(cmd, int(abs(rotation_needed_deg))):
                     self.emergency_land()
                     return False
-                print("✓ Movement complete")
+                print("✓ Rotation complete")
+
+            # Step 3: Detect ANY tag in camera (KEY FIX - not just target!)
+            print("\n📍 Detecting ANY tag in camera for refinement...")
+            any_tag_detection = self.detect_any_tag_in_camera(timeout_sec=5.0)
+
+            if any_tag_detection is not None:
+                visible_tag_id, visible_dist, visible_angle, _ = any_tag_detection
+
+                if visible_tag_id == tag_id:
+                    # Lucky! We can see the target tag directly
+                    print(f"✓ Can see target tag {tag_id} directly")
+                    distance_cm = visible_dist
+                    angle_deg = visible_angle
+                else:
+                    # Can see a different tag - use it to calculate target position
+                    print(f"✓ Using visible tag {visible_tag_id} to navigate to tag {tag_id}")
+
+                    result = self.calculate_target_angle_and_distance_from_visible_tag(
+                        tag_id, visible_tag_id, visible_angle
+                    )
+
+                    if result is None:
+                        self.get_logger().error('Failed to calculate target from visible tag')
+                        self.emergency_land()
+                        return False
+
+                    angle_deg, distance_cm = result
+
+                # Step 4: Fine rotation if needed
+                if abs(angle_deg) > 5:
+                    print(f"\n📍 Fine-tuning rotation ({angle_deg:.1f}°)...")
+
+                    if angle_deg > 0:
+                        cmd = 'rotate_clockwise'
+                    else:
+                        cmd = 'rotate_counter_clockwise'
+
+                    if not self.send_command(cmd, int(abs(angle_deg))):
+                        self.emergency_land()
+                        return False
+                    print("✓ Fine rotation complete")
+
             else:
-                self.get_logger().info('Already close to tag, skipping forward movement')
+                # No tags visible - fall back to TF-only navigation
+                print("\n⚠️  No tags visible in camera - using TF-only navigation")
 
-            # Navigation complete - stay in the air
-            print("\n✓ Navigation complete (hovering)")
+                try:
+                    # Get distance from TF
+                    camera_tf = self.tf_buffer.lookup_transform(
+                        'map', 'camera_link', rclpy.time.Time(),
+                        timeout=rclpy.duration.Duration(seconds=0.5)
+                    )
+                    target_tf = self.tf_buffer.lookup_transform(
+                        'map', f'tag_{tag_id}', rclpy.time.Time(),
+                        timeout=rclpy.duration.Duration(seconds=0.5)
+                    )
 
+                    cam_x = camera_tf.transform.translation.x
+                    cam_y = camera_tf.transform.translation.y
+                    tgt_x = target_tf.transform.translation.x
+                    tgt_y = target_tf.transform.translation.y
+
+                    dx = tgt_x - cam_x
+                    dy = tgt_y - cam_y
+                    distance_cm = math.sqrt(dx**2 + dy**2) * 100
+
+                except Exception as e:
+                    self.get_logger().error(f'TF-only navigation failed: {e}')
+                    self.emergency_land()
+                    return False
+
+            # Step 5: Move forward
+            # Apply safety buffer
+            forward_distance = max(0, distance_cm - self.approach_distance)
+            forward_distance = min(forward_distance, self.max_forward)
+
+            if forward_distance > 20:
+                print(f"\n📍 Moving forward {forward_distance:.0f}cm...")
+                if not self.send_command('move_forward', int(forward_distance)):
+                    self.emergency_land()
+                    return False
+                print("✓ Forward movement complete")
+            else:
+                print("\n✓ Already at target distance")
+
+            # Step 6: Land
+            print("\n📍 Landing...")
+            if not self.send_command('land'):
+                self.emergency_land()
+                return False
+
+            self.in_flight = False
+            print("✓ Landed successfully!")
             return True
 
         except Exception as e:
             self.get_logger().error(f'Navigation failed: {e}')
-            self.emergency_land()
-            return False
-
-    def _navigate_to_horizontal_tag(self, dx: float, dy: float, dz: float) -> bool:
-        """
-        Navigate to a horizontal tag (on the ground or a surface).
-        Position above it and land directly on top.
-
-        Args:
-            dx, dy, dz: Relative position of tag from camera (meters)
-        """
-        # Calculate horizontal distance and angle
-        horizontal_dist = math.sqrt(dx**2 + dy**2)
-        angle_to_tag = math.atan2(dx, dy)
-        angle_deg = math.degrees(angle_to_tag)
-
-        # Convert to cm for Tello commands
-        horizontal_dist_cm = horizontal_dist * 100
-        vertical_dist_cm = dz * 100
-
-        self.get_logger().info(
-            f'Horizontal tag navigation: rotate {angle_deg:.1f}°, '
-            f'forward {horizontal_dist_cm:.1f}cm, vertical_adjust {vertical_dist_cm:.1f}cm'
-        )
-
-        # Confirm with user
-        print(f"\n📋 Navigation Plan (HORIZONTAL TAG - WILL LAND ON TOP):")
-        if abs(vertical_dist_cm) > 20:
-            if vertical_dist_cm > 0:
-                print(f"   Move up: {abs(vertical_dist_cm):.1f}cm")
-            else:
-                print(f"   Move down: {abs(vertical_dist_cm):.1f}cm")
-        print(f"   Rotate: {angle_deg:.1f}°")
-        print(f"   Move forward: {horizontal_dist_cm:.1f}cm (to position above tag)")
-        print(f"   Land directly on tag")
-
-        response = input("\nExecute? (y/n): ").strip().lower()
-        if response != 'y':
-            self.get_logger().info('Navigation cancelled by user')
-            return False
-
-        try:
-            # Step 1: Adjust height if needed (to be level with or slightly above tag)
-            if abs(vertical_dist_cm) > 20:
-                if vertical_dist_cm > 0:
-                    move_up_cm = min(abs(vertical_dist_cm), 500)
-                    print(f"\n📍 Adjusting altitude (up {move_up_cm:.0f}cm)...")
-                    if not self.send_command('move_up', int(move_up_cm)):
-                        self.emergency_land()
-                        return False
-                else:
-                    move_down_cm = min(abs(vertical_dist_cm), 500)
-                    print(f"\n📍 Adjusting altitude (down {move_down_cm:.0f}cm)...")
-                    if not self.send_command('move_down', int(move_down_cm)):
-                        self.emergency_land()
-                        return False
-                print("✓ Height adjusted")
-
-            # Step 2: Rotate to face tag
-            if abs(angle_deg) > 5:
-                print(f"\n📍 Rotating to face tag ({abs(angle_deg):.1f}°)...")
-                if angle_deg > 0:
-                    if not self.send_command('rotate_clockwise', int(abs(angle_deg))):
-                        self.emergency_land()
-                        return False
-                else:
-                    if not self.send_command('rotate_counter_clockwise', int(abs(angle_deg))):
-                        self.emergency_land()
-                        return False
-                print("✓ Rotation complete")
-
-            # Step 3: Move forward to position above tag (no buffer needed)
-            forward_dist = min(horizontal_dist_cm, self.max_forward)
-
-            if forward_dist > 20:
-                print(f"\n📍 Moving forward ({forward_dist:.0f}cm) to position above tag...")
-                if not self.send_command('move_forward', int(forward_dist)):
-                    self.emergency_land()
-                    return False
-                print("✓ Positioned above tag")
-            else:
-                self.get_logger().info('Already above tag')
-
-            # Step 4: Position above tag (stay hovering)
-            print("\n✓ Positioned above tag (hovering)")
-
-            return True
-
-        except Exception as e:
-            self.get_logger().error(f'Navigation failed: {e}')
+            import traceback
+            self.get_logger().error(traceback.format_exc())
             self.emergency_land()
             return False
 
@@ -650,17 +923,22 @@ class TelloArucoNavigatorNode(Node):
         print("Make sure the camera and environment nodes are running!")
         print("="*50 + "\n")
 
-        # Wait for TF buffer to populate
-        print("Waiting for TF tree to populate...")
+        # Wait for TF buffer to populate (increased from 3 to 5 iterations)
+        print("Waiting for TF tree and tag data to populate...")
         self.get_logger().info('Waiting for TF tree to populate...')
 
-        # Spin for a few seconds to let TF messages arrive
+        # Spin for a few seconds to let TF messages and MarkerArray arrive
         import time
-        for _ in range(3):
+        for i in range(5):
             rclpy.spin_once(self, timeout_sec=1.0)
             time.sleep(0.5)
+            # Log progress
+            if i == 2:
+                tags_found = len(self.available_tags)
+                if tags_found > 0:
+                    self.get_logger().info(f'Found {tags_found} tags so far...')
 
-        self.get_logger().info('TF buffer ready')
+        self.get_logger().info(f'TF buffer ready. Total tags: {len(self.available_tags)}')
 
         while True:
             try:
@@ -687,25 +965,57 @@ class TelloArucoNavigatorNode(Node):
                 self.in_flight = True
                 print("✓ Airborne\n")
 
-                # Fly up for better visibility
-                print("Flying up 50cm for better view...")
-                if not self.send_command('move_up', 50):
+                # Fly up and rotate until we see a tag (to localize position)
+                print("Flying up 30cm for better view...")
+                if not self.send_command('move_up', 30):
                     self.emergency_land()
                     continue
                 print("✓ Altitude gained\n")
 
-                # Check if we're localized, if not, search
-                if not self.is_localized():
-                    print("⚠️  Not localized yet, searching for known tags...")
+                # Rotate until we see a tag and become localized
+                print("📍 Rotating to find ArUco tags for localization...")
 
-                    if not self.search_and_localize(stay_airborne=True):
-                        print("\n❌ Failed to localize")
+                # Spin TF buffer to get latest transforms
+                for _ in range(5):
+                    rclpy.spin_once(self, timeout_sec=0.2)
+
+                max_search_rotation = 360
+                rotation_increment = 30
+                total_rotation = 0
+
+                while total_rotation < max_search_rotation and not self.is_localized():
+                    # Check if we can see any tags now
+                    available_tags = self.get_available_tags()
+                    if len(available_tags) > 0:
+                        print(f"✓ Found {len(available_tags)} tag(s): {sorted(available_tags)}")
+                        self.get_logger().info(f'Localized with tags: {sorted(available_tags)}')
+                        break
+
+                    # Rotate a bit more to search
+                    print(f"  Rotating to search... ({total_rotation}° / {max_search_rotation}°)")
+                    if not self.send_command('rotate_clockwise', rotation_increment):
                         self.emergency_land()
-
-                        response = input("\nTry again? (y/n): ").strip().lower()
-                        if response != 'y':
-                            break
                         continue
+
+                    total_rotation += rotation_increment
+
+                    # Give TF buffer time to update
+                    import time
+                    time.sleep(0.5)
+                    for _ in range(3):
+                        rclpy.spin_once(self, timeout_sec=0.2)
+
+                # Final check if we're localized
+                if not self.is_localized():
+                    print("\n❌ Could not find any tags after full rotation")
+                    self.emergency_land()
+
+                    response = input("\nTry again? (y/n): ").strip().lower()
+                    if response != 'y':
+                        break
+                    continue
+
+                print("✓ Localized!\n")
 
                 # Navigate to selected tag
                 print("\n" + "="*50)
@@ -715,41 +1025,22 @@ class TelloArucoNavigatorNode(Node):
                 success = self.navigate_to_tag(tag_id)
 
                 if success:
-                    print("\n✅ Navigation complete!")
+                    print("\n✅ Navigation complete and landed!")
+                    # Drone is now on the ground
+                    self.in_flight = False
+
+                    # Ask if user wants to fly to another tag
+                    response = input("\nNavigate to another tag? (y/n): ").strip().lower()
+                    if response == 'y':
+                        continue  # Loop back to tag selection
+                    else:
+                        self.get_logger().info('User chose to quit')
+                        break  # Exit program
                 else:
+                    # Navigation failed
                     print("\n❌ Navigation failed")
-                    if self.in_flight:
-                        self.emergency_land()
+                    # Already emergency landed if needed
                     continue
-
-                # Drone is still in the air - ask what to do next
-                print("\n" + "="*50)
-                print("📋 NEXT ACTION")
-                print("="*50)
-                print("  1. Navigate to another tag (stay airborne)")
-                print("  2. Land and quit")
-                print("="*50)
-
-                response = input("\nChoose (1/2): ").strip()
-
-                if response == '1':
-                    # Stay in the air, loop continues
-                    continue
-                elif response == '2':
-                    # Land and exit
-                    print("\n📍 Landing...")
-                    if self.in_flight:
-                        self.send_command('land')
-                        self.in_flight = False
-                    print("✓ Landed")
-                    self.get_logger().info('User requested landing and quit')
-                    break
-                else:
-                    print("Invalid choice, landing for safety...")
-                    if self.in_flight:
-                        self.send_command('land')
-                        self.in_flight = False
-                    break
 
             except KeyboardInterrupt:
                 self.get_logger().info('Interrupted by user')

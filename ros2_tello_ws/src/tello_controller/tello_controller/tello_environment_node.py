@@ -9,7 +9,7 @@ from scipy.spatial.transform import Rotation
 
 
 import tf2_ros
-from tf2_ros import TransformBroadcaster
+from tf2_ros import TransformBroadcaster, StaticTransformBroadcaster
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from visualization_msgs.msg import MarkerArray
 from tello_interfaces.msg import TelloTelemetry
@@ -48,7 +48,8 @@ class TelloEnvironmentNode(Node):
 
         # tags/map/drone tf publishers
         # First tag becomes origin, try using mostly relative positions
-        self.tf_broadcaster = TransformBroadcaster(self)
+        self.tf_broadcaster = TransformBroadcaster(self)  # For camera_link (dynamic)
+        self.static_tf_broadcaster = StaticTransformBroadcaster(self)  # For tags (static)
         
         # Create subscribers
         # Subscribe to camera feed
@@ -175,6 +176,32 @@ class TelloEnvironmentNode(Node):
                     f"Tag {marker_id}: reproj_error={reprojection_error:.2f}px, "
                     f"distance={distance:.3f}m"
                 )
+
+            # ========== POSE QUALITY VALIDATION ==========
+            # Reject observations that would corrupt pose estimates
+
+            REPROJ_ERROR_THRESHOLD = 3.0  # pixels
+            MAX_PITCH_ROLL = 30.0  # degrees
+
+            # Check 1: Reprojection error
+            if reprojection_error > REPROJ_ERROR_THRESHOLD:
+                self.get_logger().warn(
+                    f"Rejecting tag_{marker_id}: reproj_error={reprojection_error:.2f}px > {REPROJ_ERROR_THRESHOLD}px"
+                )
+                continue  # Skip this observation
+
+            # Check 2: Camera orientation (use telemetry)
+            if self.latest_telemetry is not None:
+                pitch = abs(self.latest_telemetry.pitch)
+                roll = abs(self.latest_telemetry.roll)
+
+                if pitch > MAX_PITCH_ROLL or roll > MAX_PITCH_ROLL:
+                    self.get_logger().warn(
+                        f"Rejecting tag_{marker_id}: extreme orientation pitch={pitch:.1f}°, roll={roll:.1f}°"
+                    )
+                    continue  # Skip this observation
+
+            # ========== END VALIDATION ==========
 
             # Invert transformation: T_camera_marker -> T_marker_camera
             R_camera_marker = cv2.Rodrigues(rvec)[0]  # Convert rvec to rotation matrix
@@ -557,7 +584,7 @@ class TelloEnvironmentNode(Node):
             transform.transform.rotation.z = float(tag_data['orientation'][2])
             transform.transform.rotation.w = float(tag_data['orientation'][3])
 
-            self.tf_broadcaster.sendTransform(transform)
+            self.static_tf_broadcaster.sendTransform(transform)
     
 def main(args=None):
     # Initialize ROS2

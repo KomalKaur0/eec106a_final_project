@@ -16,12 +16,17 @@ ros2 run tello_controller tello_multi_ar_tag_mission_node \
 
 ## TF tree
 map
+ └── tag_{marker_id} (first one found)
+   └── tag_{marker_id}
+     └── tag_{marker_id}
+   └── tag_{marker_id}
+   ...
 
  └── base_link
 
       └── camera_link
 
-           └── tag_{marker_id}
+           
 
 ### coordinate convention
 map (world frame):

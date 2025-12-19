@@ -15,6 +15,7 @@ find_package(std_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/TelloTelemetry.msg"
   "srv/SetCameraMode.srv"
+  "srv/TelloCommand.srv"
   DEPENDENCIES std_msgs
 )
 

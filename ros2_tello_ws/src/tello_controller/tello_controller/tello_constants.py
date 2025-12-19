@@ -25,7 +25,7 @@ CAMERA_MATRIX = np.array([
 ], dtype=np.float32)
 
 # Distortion coefficients [k1, k2, p1, p2, k3]
-# Tello camera has minimal distortion, so these are typically near zero
+# Tello camera has minimal distortion, so using 0 as approximation
 DISTORTION_COEFFS = np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
 # ==============================================================================
@@ -38,8 +38,8 @@ ARUCO_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 # ArUco detector parameters (use defaults)
 ARUCO_PARAMS = cv2.aruco.DetectorParameters()
 
-# Marker physical size in meters <- our printed markers are 15 cm
-MARKER_SIZE_M = 0.15  # 15 cm
+# Marker physical size in meters <- our printed markers are 17.7 cm
+MARKER_SIZE_M = 0.177  # 17.7 cm
 
 # ==============================================================================
 # Camera Frame Settings

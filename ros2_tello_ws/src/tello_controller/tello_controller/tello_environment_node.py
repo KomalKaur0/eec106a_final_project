@@ -9,7 +9,7 @@ from scipy.spatial.transform import Rotation
 
 
 import tf2_ros
-from tf2_ros import TransformBroadcaster
+from tf2_ros import TransformBroadcaster, StaticTransformBroadcaster
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from visualization_msgs.msg import MarkerArray
 from tello_interfaces.msg import TelloTelemetry
@@ -48,7 +48,8 @@ class TelloEnvironmentNode(Node):
 
         # tags/map/drone tf publishers
         # First tag becomes origin, try using mostly relative positions
-        self.tf_broadcaster = TransformBroadcaster(self)
+        self.tf_broadcaster = TransformBroadcaster(self)  # For camera_link (dynamic)
+        self.static_tf_broadcaster = StaticTransformBroadcaster(self)  # For tags (static)
         
         # Create subscribers
         # Subscribe to camera feed
@@ -75,6 +76,9 @@ class TelloEnvironmentNode(Node):
         # Latest telemetry data for sensor fusion
         self.latest_telemetry = None
 
+        # Last known camera pose (maintained for continuous publishing)
+        self.last_camera_transform = None
+
         # Camera intrinsics (from constants file)
         self.camera_matrix = tc.CAMERA_MATRIX
         self.dist_coeffs = tc.DISTORTION_COEFFS
@@ -92,6 +96,18 @@ class TelloEnvironmentNode(Node):
 
         # Timer to publish static map transforms
         self.map_timer = self.create_timer(0.1, self.publish_static_map)  # 10 Hz
+
+        # Timer to periodically publish all known tags (for navigator to see)
+        self.tag_publish_timer = self.create_timer(
+            0.5,  # Publish at 2 Hz
+            self.publish_all_known_tags
+        )
+
+        # Timer to continuously publish camera_link transform (even when no tags visible)
+        self.camera_link_timer = self.create_timer(
+            0.1,  # Publish at 10 Hz
+            self.publish_camera_link
+        )
 
         self.get_logger().info("Tello Environment Node initialized")
 
@@ -161,6 +177,32 @@ class TelloEnvironmentNode(Node):
                     f"distance={distance:.3f}m"
                 )
 
+            # ========== POSE QUALITY VALIDATION ==========
+            # Reject observations that would corrupt pose estimates
+
+            REPROJ_ERROR_THRESHOLD = 3.0  # pixels
+            MAX_PITCH_ROLL = 30.0  # degrees
+
+            # Check 1: Reprojection error
+            if reprojection_error > REPROJ_ERROR_THRESHOLD:
+                self.get_logger().warn(
+                    f"Rejecting tag_{marker_id}: reproj_error={reprojection_error:.2f}px > {REPROJ_ERROR_THRESHOLD}px"
+                )
+                continue  # Skip this observation
+
+            # Check 2: Camera orientation (use telemetry)
+            if self.latest_telemetry is not None:
+                pitch = abs(self.latest_telemetry.pitch)
+                roll = abs(self.latest_telemetry.roll)
+
+                if pitch > MAX_PITCH_ROLL or roll > MAX_PITCH_ROLL:
+                    self.get_logger().warn(
+                        f"Rejecting tag_{marker_id}: extreme orientation pitch={pitch:.1f}°, roll={roll:.1f}°"
+                    )
+                    continue  # Skip this observation
+
+            # ========== END VALIDATION ==========
+
             # Invert transformation: T_camera_marker -> T_marker_camera
             R_camera_marker = cv2.Rodrigues(rvec)[0]  # Convert rvec to rotation matrix
             R_marker_camera = R_camera_marker.T        # Invert rotation (transpose)
@@ -170,7 +212,7 @@ class TelloEnvironmentNode(Node):
             rot_marker_camera = Rotation.from_matrix(R_marker_camera)
             quat_camera = rot_marker_camera.as_quat()  # Returns [x, y, z, w]
 
-            # Store this observation for multi-tag registration
+            # store this observation for multi-tag registration
             # Flatten tvec to ensure it's 1D array shape (3,) not (3,1)
             current_observations[marker_id] = {
                 'tvec': tvec_marker_camera.flatten(),
@@ -180,6 +222,10 @@ class TelloEnvironmentNode(Node):
 
         # After processing all visible tags, update the persistent map
         self.update_tag_map(current_observations)
+
+        # Publish ArUco markers for rtab-map
+        if len(current_observations) > 0:
+            self.publish_aruco_markers(current_observations)
 
         # Publish camera pose in map frame (avoids conflicts from multiple visible tags)
         if len(current_observations) > 0 and self.map_frame is not None:
@@ -247,7 +293,7 @@ class TelloEnvironmentNode(Node):
                 # Update existing tag
                 self.tag_map[marker_id]['observations'] += 1
                 self.tag_map[marker_id]['last_seen'] = self.get_clock().now()
-                # Could implement pose refinement here (e.g., averaging)
+                # TODO: maybe pose refinement
 
     def _register_new_tag(self, new_id, new_obs, all_observations):
         """
@@ -383,7 +429,7 @@ class TelloEnvironmentNode(Node):
         rot = Rotation.from_matrix(R_map_camera)
         quat_map_camera = rot.as_quat()  # [x, y, z, w]
 
-        # Publish map -> camera_link transform
+        # Store camera pose for continuous publishing
         transform = TransformStamped()
         transform.header.stamp = self.get_clock().now().to_msg()
         transform.header.frame_id = "map"
@@ -398,7 +444,118 @@ class TelloEnvironmentNode(Node):
         transform.transform.rotation.z = float(quat_map_camera[2])
         transform.transform.rotation.w = float(quat_map_camera[3])
 
-        self.tf_broadcaster.sendTransform(transform)
+        # Store for continuous publishing by timer
+        self.last_camera_transform = transform
+
+    def publish_aruco_markers(self, observations):
+        """
+        Publish detected ArUco markers for rtab-map landmark integration.
+
+        Args:
+            observations: dict of {marker_id: {'tvec': ..., 'quat': ..., 'R': ...}}
+        """
+        from visualization_msgs.msg import Marker
+
+        marker_array = MarkerArray()
+
+        for marker_id, obs in observations.items():
+            marker = Marker()
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.header.frame_id = 'tello_camera'
+            marker.ns = 'aruco'
+            marker.id = int(marker_id)  # Convert numpy int to Python int
+            marker.type = Marker.CUBE
+            marker.action = Marker.ADD
+
+            # Position from tag detection
+            marker.pose.position.x = float(obs['tvec'][0])
+            marker.pose.position.y = float(obs['tvec'][1])
+            marker.pose.position.z = float(obs['tvec'][2])
+
+            # Orientation from quaternion
+            marker.pose.orientation.x = float(obs['quat'][0])
+            marker.pose.orientation.y = float(obs['quat'][1])
+            marker.pose.orientation.z = float(obs['quat'][2])
+            marker.pose.orientation.w = float(obs['quat'][3])
+
+            # Size matches physical tag (15cm)
+            marker.scale.x = 0.15
+            marker.scale.y = 0.15
+            marker.scale.z = 0.01
+
+            # Color - orange for visibility
+            marker.color.r = 1.0
+            marker.color.g = 0.5
+            marker.color.b = 0.0
+            marker.color.a = 0.8
+
+            marker_array.markers.append(marker)
+
+        self.aruco_pose_publisher.publish(marker_array)
+
+    def publish_all_known_tags(self):
+        """
+        Periodically publish all known tags from the persistent map.
+
+        This ensures the navigator always has an up-to-date list of available tags,
+        even if they're not currently visible in the camera frame.
+        """
+        if len(self.tag_map) == 0:
+            return
+
+        from visualization_msgs.msg import Marker
+
+        marker_array = MarkerArray()
+
+        for marker_id, tag_data in self.tag_map.items():
+            marker = Marker()
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.header.frame_id = 'map'  # Use map frame since we have global positions
+            marker.ns = 'aruco_persistent'
+            marker.id = int(marker_id)
+            marker.type = Marker.CUBE
+            marker.action = Marker.ADD
+
+            # Position from persistent tag map
+            marker.pose.position.x = float(tag_data['position'][0])
+            marker.pose.position.y = float(tag_data['position'][1])
+            marker.pose.position.z = float(tag_data['position'][2])
+
+            # Orientation from persistent tag map
+            marker.pose.orientation.x = float(tag_data['orientation'][0])
+            marker.pose.orientation.y = float(tag_data['orientation'][1])
+            marker.pose.orientation.z = float(tag_data['orientation'][2])
+            marker.pose.orientation.w = float(tag_data['orientation'][3])
+
+            # Size matches physical tag (15cm)
+            marker.scale.x = 0.15
+            marker.scale.y = 0.15
+            marker.scale.z = 0.01
+
+            # Color - blue for persistent tags (different from orange real-time)
+            marker.color.r = 0.0
+            marker.color.g = 0.5
+            marker.color.b = 1.0
+            marker.color.a = 0.6
+
+            marker_array.markers.append(marker)
+
+        self.aruco_pose_publisher.publish(marker_array)
+
+    def publish_camera_link(self):
+        """
+        Continuously publish the last known camera_link transform.
+        This ensures camera_link is always available in TF tree,
+        even when no ArUco tags are currently visible.
+        """
+        if self.last_camera_transform is None:
+            return
+
+        # Update timestamp to current time
+        self.last_camera_transform.header.stamp = self.get_clock().now().to_msg()
+
+        # Broadcast the transform
+        self.tf_broadcaster.sendTransform(self.last_camera_transform)
 
     def publish_static_map(self):
         """
@@ -427,7 +584,7 @@ class TelloEnvironmentNode(Node):
             transform.transform.rotation.z = float(tag_data['orientation'][2])
             transform.transform.rotation.w = float(tag_data['orientation'][3])
 
-            self.tf_broadcaster.sendTransform(transform)
+            self.static_tf_broadcaster.sendTransform(transform)
     
 def main(args=None):
     # Initialize ROS2

@@ -1029,7 +1029,7 @@ class TelloArucoNavigatorNode(Node):
 
                 # Final check if we're localized
                 if not self.is_localized():
-                    print("\n❌ Could not find any tags after full rotation")
+                    print("\nCould not find any tags after full rotation")
                     self.emergency_land()
 
                     response = input("\nTry again? (y/n): ").strip().lower()
@@ -1037,11 +1037,11 @@ class TelloArucoNavigatorNode(Node):
                         break
                     continue
 
-                print("✓ Localized!\n")
+                print("Localized!\n")
 
                 # Navigate to selected tag
                 print("\n" + "="*50)
-                print(f"🎯 NAVIGATING TO TAG {tag_id}")
+                print(f"NAVIGATING TO TAG {tag_id}")
                 print("="*50)
 
                 success = self.navigate_to_tag(tag_id)
@@ -1060,7 +1060,7 @@ class TelloArucoNavigatorNode(Node):
                         break  # Exit program
                 else:
                     # Navigation failed
-                    print("\n❌ Navigation failed")
+                    print("\nNavigation failed")
                     # Already emergency landed if needed
                     continue
 

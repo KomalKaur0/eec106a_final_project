@@ -33,8 +33,7 @@ class TelloArTagMissionNode(Node):
     def __init__(self):
         super().__init__("tello_ar_tag_mission_node")
 
-        # ---------------- Parameters ----------------
-        self.declare_parameter("hover_height", 70)        # kept but no longer used for extra up
+        # Parameters
         self.declare_parameter("marker_id", 1)            # ArUco ID
         self.declare_parameter("tag_size_cm", 17.7)       # your tag = 177 mm
         self.declare_parameter("search_timeout", 40.0)    # seconds
@@ -46,11 +45,7 @@ class TelloArTagMissionNode(Node):
         self.search_timeout = float(self.get_parameter("search_timeout").value)
         self.show_debug = bool(self.get_parameter("show_debug_window").value)
 
-        # Clamp hover height to safe range (not actually used anymore)
-        self.hover_height = max(40, min(self.hover_height, 150))
-
-        # Approximate focal length for Tello camera in pixels.
-        # This is an empirical estimate; you can tune it if distances are off.
+        # Approximate focal length for Tello camera in pixels
         self.focal_length_px = 920.0
 
         self.get_logger().info(
@@ -70,9 +65,9 @@ class TelloArTagMissionNode(Node):
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_1000)
         self.aruco_params = cv2.aruco.DetectorParameters()
 
-    # ------------------------------------------------
+    # ------------------------
     # Tello connection & video
-    # ------------------------------------------------
+    # ------------------------
 
     def connect_tello(self) -> bool:
         """Connect to Tello and start video stream."""
@@ -102,7 +97,7 @@ class TelloArTagMissionNode(Node):
             return False
 
     def get_frame(self):
-        """Safely get the latest frame from Tello camera."""
+        """Get the latest frame from Tello camera."""
         if self.frame_read is None:
             return None
         frame = self.frame_read.frame
@@ -110,9 +105,9 @@ class TelloArTagMissionNode(Node):
             return None
         return frame.copy()
 
-    # ------------------------------------------------
+    # ---------------
     # ArUco detection
-    # ------------------------------------------------
+    # ---------------
 
     def detect_marker(self, frame):
         """
@@ -338,7 +333,7 @@ class TelloArTagMissionNode(Node):
         plt.pause(0.1)
 
         # Wait for manual approval
-        input("✔ Path planned. Press ENTER in this terminal to execute the planned path... ")
+        input("Path planned. Press ENTER in this terminal to execute the planned path... ")
 
     # ------------------------------------------------
     # Execute path

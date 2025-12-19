@@ -77,7 +77,7 @@ class TelloCameraNode(Node):
             self.tello.streamon()
             self.frame_read = self.tello.get_frame_read()
             
-            self.get_logger().info('✓ Video stream started')
+            self.get_logger().info('Video stream started')
             
             # Create timer for publishing frames
             timer_period = 1.0 / self.publish_rate

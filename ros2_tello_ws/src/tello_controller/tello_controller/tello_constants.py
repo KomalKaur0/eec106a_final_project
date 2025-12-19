@@ -25,7 +25,7 @@ CAMERA_MATRIX = np.array([
 ], dtype=np.float32)
 
 # Distortion coefficients [k1, k2, p1, p2, k3]
-# Tello camera has minimal distortion, so these are typically near zero
+# Tello camera has minimal distortion, so using 0 as approximation
 DISTORTION_COEFFS = np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
 # ==============================================================================

@@ -212,7 +212,7 @@ class TelloEnvironmentNode(Node):
             rot_marker_camera = Rotation.from_matrix(R_marker_camera)
             quat_camera = rot_marker_camera.as_quat()  # Returns [x, y, z, w]
 
-            # Store this observation for multi-tag registration
+            # store this observation for multi-tag registration
             # Flatten tvec to ensure it's 1D array shape (3,) not (3,1)
             current_observations[marker_id] = {
                 'tvec': tvec_marker_camera.flatten(),
@@ -293,7 +293,7 @@ class TelloEnvironmentNode(Node):
                 # Update existing tag
                 self.tag_map[marker_id]['observations'] += 1
                 self.tag_map[marker_id]['last_seen'] = self.get_clock().now()
-                # TODO: Could implement pose refinement here (e.g., averaging)
+                # TODO: maybe pose refinement
 
     def _register_new_tag(self, new_id, new_obs, all_observations):
         """

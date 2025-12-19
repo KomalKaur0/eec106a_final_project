@@ -533,7 +533,7 @@ class TelloArucoNavigatorNode(Node):
             self.get_logger().info('Already localized')
             return True
 
-        print("\n⚠️  Not localized - rotating to find ANY tag...")
+        print("\nNot localized - rotating to find a tag...")
         self.get_logger().warn('Lost localization, searching for tags...')
 
         import time
@@ -556,7 +556,7 @@ class TelloArucoNavigatorNode(Node):
 
                 # Check if we're now localized
                 if self.is_localized():
-                    print("✓ Localized!")
+                    print("Localized!")
                     self.get_logger().info('Successfully re-localized')
                     return True
 
@@ -731,7 +731,7 @@ class TelloArucoNavigatorNode(Node):
         """
         Navigate to tag using hybrid approach:
         1. Use TF to verify tag exists in map and calculate initial bearing
-        2. Rotate to face tag (using TF for coarse alignment)
+        2. Rotate to face tag (using TF for course alignment)
         3. Use fresh camera detection for final approach (fixes stale data bug)
 
         Returns:
@@ -801,7 +801,7 @@ class TelloArucoNavigatorNode(Node):
 
             # Step 2: Rotate to face tag (coarse alignment)
             if abs(rotation_needed_deg) > 5:
-                print(f"\n📍 Rotating {rotation_needed_deg:.1f}° to face tag...")
+                print(f"\nRotating {rotation_needed_deg:.1f}° to face tag...")
 
                 if rotation_needed_deg > 0:
                     cmd = 'rotate_clockwise'
@@ -814,7 +814,7 @@ class TelloArucoNavigatorNode(Node):
                 print("✓ Rotation complete")
 
             # Step 3: Detect ANY tag in camera (KEY FIX - not just target!)
-            print("\n📍 Detecting ANY tag in camera for refinement...")
+            print("\nDetecting ANY tag in camera for refinement...")
             any_tag_detection = self.detect_any_tag_in_camera(timeout_sec=5.0)
 
             if any_tag_detection is not None:
@@ -822,12 +822,12 @@ class TelloArucoNavigatorNode(Node):
 
                 if visible_tag_id == tag_id:
                     # Lucky! We can see the target tag directly
-                    print(f"✓ Can see target tag {tag_id} directly")
+                    print(f"Can see target tag {tag_id} directly")
                     distance_cm = visible_dist
                     angle_deg = visible_angle
                 else:
                     # Can see a different tag - use it to calculate target position
-                    print(f"✓ Using visible tag {visible_tag_id} to navigate to tag {tag_id}")
+                    print(f"Using visible tag {visible_tag_id} to navigate to tag {tag_id}")
 
                     result = self.calculate_target_angle_and_distance_from_visible_tag(
                         tag_id, visible_tag_id, visible_angle
@@ -842,7 +842,7 @@ class TelloArucoNavigatorNode(Node):
 
                 # Step 4: Fine rotation if needed
                 if abs(angle_deg) > 5:
-                    print(f"\n📍 Fine-tuning rotation ({angle_deg:.1f}°)...")
+                    print(f"\nFine-tuning rotation ({angle_deg:.1f}°)...")
 
                     if angle_deg > 0:
                         cmd = 'rotate_clockwise'
@@ -856,7 +856,7 @@ class TelloArucoNavigatorNode(Node):
 
             else:
                 # No tags visible - fall back to TF-only navigation
-                print("\n⚠️  No tags visible in camera - using TF-only navigation")
+                print("\nNo tags visible in camera - using TF-only navigation")
 
                 try:
                     # Get distance from TF
@@ -889,7 +889,7 @@ class TelloArucoNavigatorNode(Node):
             forward_distance = min(forward_distance, self.max_forward)
 
             if forward_distance > 20:
-                print(f"\n📍 Moving forward {forward_distance:.0f}cm...")
+                print(f"\nMoving forward {forward_distance:.0f}cm...")
                 if not self.send_command('move_forward', int(forward_distance)):
                     self.emergency_land()
                     return False
@@ -898,13 +898,13 @@ class TelloArucoNavigatorNode(Node):
                 print("\n✓ Already at target distance")
 
             # Step 6: Land
-            print("\n📍 Landing...")
+            print("\nLanding...")
             if not self.send_command('land'):
                 self.emergency_land()
                 return False
 
             self.in_flight = False
-            print("✓ Landed successfully!")
+            print("Landed successfully!")
             return True
 
         except Exception as e:
@@ -926,7 +926,7 @@ class TelloArucoNavigatorNode(Node):
     def run_interactive_loop(self):
         """Main interactive loop for tag navigation."""
         print("\n" + "="*50)
-        print("🚁 Tello ArUco Navigator")
+        print("Tello ArUco Navigator")
         print("="*50)
         print("This tool allows you to navigate the Tello drone to ArUco tags.")
         print("Make sure the camera and environment nodes are running!")
@@ -953,7 +953,7 @@ class TelloArucoNavigatorNode(Node):
             try:
                 # Get target tag from user (while on ground)
                 print("\n" + "="*50)
-                print("📋 SELECT TARGET TAG")
+                print("SELECT TARGET TAG")
                 print("="*50)
                 tag_id = self.get_user_target()
 
@@ -963,16 +963,16 @@ class TelloArucoNavigatorNode(Node):
 
                 # Take off
                 print("\n" + "="*50)
-                print("🚁 TAKEOFF")
+                print("TAKEOFF")
                 print("="*50)
                 print(f"Taking off to navigate to tag {tag_id}...")
 
                 if not self.send_command('takeoff'):
-                    print("❌ Takeoff failed")
+                    print("Takeoff failed")
                     continue
 
                 self.in_flight = True
-                print("✓ Airborne\n")
+                print("Airborne\n")
 
                 # CRITICAL: Wait for IMU to stabilize after takeoff
                 # The Tello's IMU needs 3-4 seconds to stabilize before accepting movement commands
@@ -985,17 +985,17 @@ class TelloArucoNavigatorNode(Node):
                     # Keep ROS spinning while we wait
                     rclpy.spin_once(self, timeout_sec=0.1)
                     time.sleep(0.1)
-                print("✓ IMU stabilized\n")
+                print("IMU stabilized\n")
 
                 # Fly up and rotate until we see a tag (to localize position)
                 print("Flying up 30cm for better view...")
                 if not self.send_command('move_up', 30):
                     self.emergency_land()
                     continue
-                print("✓ Altitude gained\n")
+                print("Altitude gained\n")
 
                 # Rotate until we see a tag and become localized
-                print("📍 Rotating to find ArUco tags for localization...")
+                print("Rotating to find ArUco tags for localization...")
 
                 # Spin TF buffer to get latest transforms
                 for _ in range(5):
@@ -1009,7 +1009,7 @@ class TelloArucoNavigatorNode(Node):
                     # Check if we can see any tags now
                     available_tags = self.get_available_tags()
                     if len(available_tags) > 0:
-                        print(f"✓ Found {len(available_tags)} tag(s): {sorted(available_tags)}")
+                        print(f"Found {len(available_tags)} tag(s): {sorted(available_tags)}")
                         self.get_logger().info(f'Localized with tags: {sorted(available_tags)}')
                         break
 
@@ -1047,7 +1047,7 @@ class TelloArucoNavigatorNode(Node):
                 success = self.navigate_to_tag(tag_id)
 
                 if success:
-                    print("\n✅ Navigation complete and landed!")
+                    print("\nNavigation complete and landed!")
                     # Drone is now on the ground
                     self.in_flight = False
 
